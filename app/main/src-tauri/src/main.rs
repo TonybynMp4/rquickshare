@@ -168,14 +168,23 @@ async fn main() -> Result<(), anyhow::Error> {
             tauri::RunEvent::Ready => {
                 trace!("RunEvent::Ready");
                 if get_startminimized(app_handle) {
+                    // Starting hidden is a convenience, so don't let it take the
+                    // app down with it: on Linux these calls go through the
+                    // window manager and can fail, and panicking here killed the
+                    // app during startup rather than just leaving the window up.
                     #[cfg(not(target_os = "macos"))]
-                    app_handle
-                        .get_webview_window("main")
-                        .unwrap()
-                        .hide()
-                        .unwrap();
+                    match app_handle.get_webview_window("main") {
+                        Some(w) => {
+                            if let Err(e) = w.hide() {
+                                warn!("RunEvent::Ready: failed to start minimized: {e}");
+                            }
+                        }
+                        None => warn!("RunEvent::Ready: no main window to minimize"),
+                    }
                     #[cfg(target_os = "macos")]
-                    app_handle.hide().unwrap();
+                    if let Err(e) = app_handle.hide() {
+                        warn!("RunEvent::Ready: failed to start minimized: {e}");
+                    }
                 }
             }
             tauri::RunEvent::ExitRequested { code, .. } => {
@@ -301,7 +310,13 @@ fn handle_window_event(w: &Window, event: &WindowEvent) {
         }
 
         trace!("handle_window_event: prevent close");
-        w.hide().unwrap();
+        // Keep the close prevented even if hiding fails. `unwrap` here meant a
+        // window-manager hiccup panicked the event handler, and since the panic
+        // replaced `prevent_close()` the window then closed anyway - the
+        // opposite of what the setting asks for.
+        if let Err(e) = w.hide() {
+            warn!("handle_window_event: failed to hide the window: {e}");
+        }
         api.prevent_close();
     }
 }
@@ -331,6 +346,26 @@ fn rs2js_endpointinfo(message: EndpointInfo, manager: &AppHandle) {
 
 fn open_main_window(app_handle: &AppHandle) {
     if let Some(webview_window) = app_handle.get_webview_window("main") {
+        // `unminimize` first, and it is not optional on Linux.
+        //
+        // Without it, restoring a *minimized* window here did nothing at all -
+        // tray "Show", and relaunching into the single-instance hook, both
+        // looked dead. Both calls it used to make are no-ops in that state, per
+        // tao's GTK backend:
+        //
+        // - `show()` becomes `gtk_widget_show_all`, which does not deiconify;
+        //   an iconified window stays iconified.
+        // - `set_focus()` is wrapped in `if !minimized`, so it returns without
+        //   sending the focus request.
+        //
+        // `unminimize()` is the one that reaches `gtk_window_deiconify`, and it
+        // also clears the flag that was gating `set_focus`.
+        //
+        // Raising afterwards is still the compositor's call: under Wayland,
+        // GNOME may answer a focus request from an unfocused client by marking
+        // the window as needing attention rather than raising it. Nothing we
+        // can override, but the window is at least back on screen.
+        let _ = webview_window.unminimize();
         let _ = webview_window.show();
         let _ = webview_window.set_focus();
         return;
@@ -339,12 +374,32 @@ fn open_main_window(app_handle: &AppHandle) {
     warn!("open_main_window: no main window found");
 }
 
+/// How long to let the service shut down cleanly before quitting regardless.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn kill_app(app_handle: &AppHandle) {
     let state: tauri::State<'_, AppState> = app_handle.state();
 
+    // This runs on the thread driving the GTK main loop, so whatever happens
+    // here the window is frozen until it returns. `stop()` waits on every
+    // spawned task, and some of them block on channel receives with no timeout
+    // of their own (the mDNS unregister acknowledgement, for one), so a stuck
+    // task would leave the window painted on screen and unresponsive with no
+    // way out but SIGKILL. Cap the wait: a clean unregister is nice, a
+    // guaranteed quit is required.
     tokio::task::block_in_place(|| {
         tauri::async_runtime::block_on(async move {
-            let _ = state.rqs.lock().await.stop().await;
+            match tokio::time::timeout(SHUTDOWN_GRACE, async {
+                state.rqs.lock().await.stop().await;
+            })
+            .await
+            {
+                Ok(()) => trace!("kill_app: service stopped cleanly"),
+                Err(_) => warn!(
+                    "kill_app: service did not stop within {}s, quitting anyway",
+                    SHUTDOWN_GRACE.as_secs()
+                ),
+            }
         });
     });
 
