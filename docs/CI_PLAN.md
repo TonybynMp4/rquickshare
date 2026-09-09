@@ -1,8 +1,11 @@
 # CI plan
 
-A proposal for a fuller CI suite: checks, builds, version bumping, releases.
-Nothing here is implemented yet — `.github/workflows/` is untouched. Written
-against the tree as of `0.13.0`.
+A plan for a fuller CI suite: checks, builds, version bumping, releases.
+Written against the tree as of `0.13.0`. **Phases 0–2 and 4.1 have landed**;
+§1 and §2 below describe the *starting* state and are kept as the record of why
+each change was made. See §5 for what is done and what is left.
+
+Windows is out of scope by decision — see §6.
 
 ## 1. Where we are today
 
@@ -159,13 +162,13 @@ Keep the existing structure; change three things.
 
 - Drop `needs: build_core` — `check.yml` covers correctness, and serialising
   costs ~4 minutes of wall clock per run for no signal.
-- Add `windows-latest` to the matrix (`target_path: app/main`,
-  `cache_directory: app/main/src-tauri/target`). `rename_build.sh` is bash-only
-  and matches `.deb/.rpm/.AppImage/.dmg`; either add `.msi/.exe` patterns and run
-  it under `shell: bash`, or skip renaming on Windows and upload raw. Prefer the
-  former so release filenames stay uniform.
 - Bump the artifact retention explicitly (`retention-days: 7`) — debug bundles are
   large and currently sit for the default 90.
+- Pass `debug` as `rename_build.sh`'s third argument, so debug and release bundles
+  stop sharing a filename.
+- Hoist the per-entry `target_path` / `name` / `dependencies` / `cache_directory`
+  matrix columns into job-level `env` and the `linux-deps` composite action; the
+  matrix is then just the OS list.
 
 ### 3.3 `release.yml` — tags matching `v*.*.*` only
 
@@ -181,8 +184,9 @@ Plus:
 - A `verify` job that runs first and asserts the tag matches
   `[workspace.package] version` in the root `Cargo.toml`, failing loudly on drift.
   This is the cheapest possible guard against §2.1 recurring.
-- Same Windows addition as `build.yml`.
 - Keep `fail_on_unmatched_files: true`; it's the right default.
+- `workflow_dispatch`'s `tag_name` input is now actually used: it drives the
+  checkout `ref`, so a manual run rebuilds the tag it names instead of `master`.
 
 ### 3.4 `release-please.yml` — unchanged triggers, fixed config
 
@@ -219,7 +223,7 @@ commit (feat:/fix:) → master
      (PR body = changelog; PR diff = version bumped everywhere)
   → merge the PR
   → release-please pushes tag vX.Y.Z
-  → release.yml verifies tag == Cargo.toml, builds 4 OSes, publishes the Release
+  → release.yml verifies tag == Cargo.toml, builds 3 OSes, publishes the Release
 ```
 
 ### Fixing the release-please config
@@ -256,7 +260,7 @@ here; noting it as the natural follow-on once releases are trustworthy.
 
 ## 5. Rollout
 
-### Phase 0 — clear the baselines (prerequisite, no CI changes)
+### Phase 0 — clear the baselines (prerequisite, no CI changes) — **done**
 
 Nothing below can be enforced until these are green — and one of them is red
 *today*. Separate commits:
@@ -273,7 +277,7 @@ regardless of whether the rest of this plan happens. If (3)–(4) turn out to be
 large, an acceptable interim is to enforce on changed files only and keep a
 shrinking allowlist — but that's a fallback, not the plan.
 
-### Phase 1 — make releases correct
+### Phase 1 — make releases correct — **done**
 
 Highest value, smallest diff, independent of Phase 0:
 
@@ -282,35 +286,43 @@ Highest value, smallest diff, independent of Phase 0:
    (`git rm --cached`) and narrow `.gitignore` from `Cargo.lock` to
    `core_lib/Cargo.lock` / `app/main/src-tauri/Cargo.lock` — or just delete them.
 3. Narrow `release.yml`'s tag filter and add the tag/version verify job.
-4. Delete the dead `ubuntu-20.04` step in `lint.yml`.
+4. Delete the dead `ubuntu-20.04` step in `lint.yml` — moot, the file is gone.
 
 Verifiable end-to-end with one throwaway `feat:` commit on a branch.
 
-### Phase 2 — split and widen the checks
+### Phase 2 — split and widen the checks — **done**
 
-1. Add the `linux-deps` composite action.
-2. Split `lint.yml` into `check.yml` with the six jobs from §3.1, all blocking.
-3. Drop `needs: build_core` from `build.yml`.
+1. Added the `linux-deps` composite action.
+2. Replaced `lint.yml` with `check.yml` (`fmt`, `clippy`, `test_rust`, and a
+   `frontend` matrix of `lint` / `ts-check` / `test`), all blocking.
+3. Dropped `needs: build_core` from `build.yml` — and `build_core` itself, since
+   `check.yml`'s `cargo test --workspace` strictly supersedes it.
 
-### Phase 3 — Windows
+Two things worth recording from the implementation:
 
-1. Add `windows-latest` to `build.yml`; get a debug bundle out.
-2. Teach `rename_build.sh` about `.msi`/`.exe`.
-3. Add it to `release.yml`.
+- `pnpm/action-setup` reads `packageManager` from `app/main/package.json` via an
+  explicit `package_json_file`; there is no `package.json` at the repo root.
+- The frontend `test` job runs with `--passWithNoTests`, so deleting the
+  `1 === 1` stub in `tests/unit/example.test.ts` doesn't turn the job red for the
+  wrong reason. As §2.3 says, the value is having it wired up before the first
+  real test, not the coverage it provides today.
 
-### Phase 4 — hardening
+### Phase 3 — hardening
 
-1. `audit.yml`.
+1. `audit.yml` — **done**. `rustsec/audit-check` plus `pnpm audit --prod`, weekly
+   and on lockfile change. Advisories only fail the workflow on the scheduled run;
+   on a PR they annotate, because a CVE published overnight is not the PR's fault.
 2. Smoke-test the Linux artifact (`xvfb-run` the AppImage, assert it stays up a
-   few seconds and exits cleanly).
-3. Revisit the updater.
+   few seconds and exits cleanly). *Not done.*
+3. Revisit the updater. *Not done.*
 
 ## 6. Open questions
 
-- **Windows support**: is it actually wanted? The `bundle.windows` config and
-  `.ico` suggest yes, but nothing has ever built there, so Phase 3 may surface real
-  porting work in `core_lib` (mDNS, BLE, D-Bus) rather than just CI work. Worth a
-  spike before committing to it in `release.yml`.
+- ~~**Windows support**: is it actually wanted?~~ **Answered: no.** Not being
+  pursued, so no `windows-latest` entry in either matrix and `rename_build.sh`
+  stays `.deb`/`.rpm`/`.AppImage`/`.dmg` only. The `bundle.windows` config and
+  `.ico` in `tauri.conf.json` are left alone; reviving this means a `core_lib`
+  porting spike (mDNS, BLE, D-Bus), not just CI work.
 - **Snap**: `release-please-config.json` references `snap/snapcraft.yaml` and
   `.gitignore` has `*.snap`. Was snap packaging dropped, or is it meant to come
   back? The plan above assumes dropped.

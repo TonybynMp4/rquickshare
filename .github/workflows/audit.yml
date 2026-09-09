@@ -1,0 +1,71 @@
+# Advisory scanning. Deliberately *not* part of check.yml: a new CVE published
+# against a transitive dependency would otherwise turn every open PR red
+# overnight for a reason none of them caused.
+name: Audit
+
+on:
+  schedule:
+    # Monday morning, so the week starts with a current picture.
+    - cron: '0 6 * * 1'
+  push:
+    branches: [ "master" ]
+    paths:
+      - '**/Cargo.lock'
+      - '**/pnpm-lock.yaml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/pnpm-lock.yaml'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  cargo:
+    name: cargo audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # On a schedule this action files (and de-duplicates) an issue per
+      # advisory; on a PR it only annotates, which is what we want.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  pnpm:
+    name: pnpm audit
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app/main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: app/main/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: app/main/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # Only production deps: an advisory in a build-time-only package cannot
+      # reach a user's machine, and dev-dep noise is what makes people stop
+      # reading audit output.
+      - name: Audit production dependencies
+        id: audit
+        continue-on-error: true
+        run: pnpm audit --prod
+
+      - name: Report
+        if: steps.audit.outcome == 'failure'
+        run: |
+          echo "::warning::pnpm audit --prod reported advisories, see the step above"
+          # A red workflow is the signal on a schedule; on a PR the warning is
+          # enough, since the PR almost never introduced the advisory.
+          if [ "${{ github.event_name }}" = "schedule" ]; then exit 1; fi
