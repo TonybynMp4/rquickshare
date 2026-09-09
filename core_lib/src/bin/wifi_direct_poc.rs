@@ -34,6 +34,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Read;
     use std::net::TcpListener;
+
     use windows::Devices::WiFiDirect::{
         WiFiDirectAdvertisementListenStateDiscoverability, WiFiDirectAdvertisementPublisher,
         WiFiDirectAdvertisementPublisherStatusChangedEventArgs,
@@ -54,9 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The bit the previous POC missed: without an autonomous group owner there
     // is no P2P group, hence no soft-AP and no virtual adapter.
     advertisement.SetIsAutonomousGroupOwnerEnabled(true)?;
-    advertisement.SetListenStateDiscoverability(
-        WiFiDirectAdvertisementListenStateDiscoverability::Normal,
-    )?;
+    advertisement
+        .SetListenStateDiscoverability(WiFiDirectAdvertisementListenStateDiscoverability::Normal)?;
 
     let legacy = advertisement.LegacySettings()?;
     legacy.SetIsEnabled(true)?;

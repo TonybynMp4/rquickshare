@@ -696,21 +696,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         // async executor breaks the in-flight handshake frames - that's what
         // caused the "Missing required fields (ReceivedPairedKeyResult)" failures
         // when the hotspot was first wired in.
-        let (handle, creds) = match tokio::task::spawn_blocking(
-            crate::hdl::WindowsWifiDirect::start,
-        )
-        .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                warn!("Bandwidth upgrade: WiFi Direct start failed: {e}");
-                return Ok(());
-            }
-            Err(e) => {
-                warn!("Bandwidth upgrade: WiFi Direct task join failed: {e}");
-                return Ok(());
-            }
-        };
+        let (handle, creds) =
+            match tokio::task::spawn_blocking(crate::hdl::WindowsWifiDirect::start).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    warn!("Bandwidth upgrade: WiFi Direct start failed: {e}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("Bandwidth upgrade: WiFi Direct task join failed: {e}");
+                    return Ok(());
+                }
+            };
 
         info!(
             "Bandwidth upgrade: WiFi Direct group up (device_name={}, ssid={}, gateway={}, port={})",
@@ -753,8 +750,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
     /// and must not be told to use.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     fn lan_ipv4() -> Option<std::net::Ipv4Addr> {
-        get_if_addrs::get_if_addrs().ok()?.into_iter().find_map(|i| {
-            match i.ip() {
+        get_if_addrs::get_if_addrs()
+            .ok()?
+            .into_iter()
+            .find_map(|i| match i.ip() {
                 std::net::IpAddr::V4(v4)
                     if !v4.is_loopback()
                         && !v4.is_link_local()
@@ -765,8 +764,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                     Some(v4)
                 }
                 _ => None,
-            }
-        })
+            })
     }
 
     /// Offer WIFI_LAN: the peer is already on our network, so just tell it where
@@ -874,21 +872,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
                 Ok(l) => {
                     info!("Bandwidth upgrade: listening on 0.0.0.0:{port}");
-                    let accepted = match tokio::time::timeout(
-                        std::time::Duration::from_secs(45),
-                        l.accept(),
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => {
-                            warn!(
+                    let accepted =
+                        match tokio::time::timeout(std::time::Duration::from_secs(45), l.accept())
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                warn!(
                                 "Bandwidth upgrade: no peer connected within 45s; staying on the \
                                  prior channel"
                             );
-                            return;
-                        }
-                    };
+                                return;
+                            }
+                        };
                     match accepted {
                         Ok((s, addr)) => {
                             info!("*** Bandwidth upgrade: phone connected from {addr} ***");
@@ -1514,9 +1510,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                                     self.prof_decrypt.as_millis() as f64 / secs,
                                     self.prof_aes.as_millis() as f64 / secs,
                                     self.prof_write.as_millis() as f64 / secs,
-                                    (elapsed.saturating_sub(self.prof_decrypt).saturating_sub(
-                                        self.prof_write
-                                    ))
+                                    (elapsed
+                                        .saturating_sub(self.prof_decrypt)
+                                        .saturating_sub(self.prof_write))
                                     .as_millis() as f64
                                         / secs,
                                 );
@@ -1615,7 +1611,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                     })
                     .unwrap_or(false);
                 if is_last_write {
-                    info!("Bandwidth upgrade: LAST_WRITE_TO_PRIOR_CHANNEL; releasing the old channel");
+                    info!(
+                        "Bandwidth upgrade: LAST_WRITE_TO_PRIOR_CHANNEL; releasing the old channel"
+                    );
                     if let Err(e) = self.send_safe_to_close_prior_channel().await {
                         warn!("send_safe_to_close_prior_channel failed: {e}");
                     }
@@ -1638,7 +1636,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                             warn!("offer_wifi_direct_upgrade (on request) failed: {}", e);
                         }
                     } else {
-                        info!("Phone requested an upgrade path; offering WIFI_LAN and WIFI_HOTSPOT");
+                        info!(
+                            "Phone requested an upgrade path; offering WIFI_LAN and WIFI_HOTSPOT"
+                        );
                         self.offer_upgrade_paths().await;
                     }
                 }
@@ -2484,7 +2484,8 @@ pub(crate) async fn introduce_upgraded_channel(
         version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
         v1: Some(location_nearby_connections::V1Frame {
             r#type: Some(
-                location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation.into(),
+                location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                    .into(),
             ),
             bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
                 event_type: Some(EventType::ClientIntroductionAck.into()),

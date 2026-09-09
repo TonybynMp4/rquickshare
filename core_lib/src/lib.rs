@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::anyhow;
 use channel::ChannelMessage;
-#[cfg(all(feature = "experimental", any(target_os = "linux", target_os = "windows")))]
+#[cfg(all(
+    feature = "experimental",
+    any(target_os = "linux", target_os = "windows")
+))]
 use hdl::BleAdvertiser;
 use hdl::MDnsDiscovery;
 use once_cell::sync::Lazy;
@@ -313,7 +316,10 @@ impl RQS {
         let ctk = CancellationToken::new();
         self.discovery_ctk = Some(ctk.clone());
 
-        #[cfg(all(feature = "experimental", any(target_os = "linux", target_os = "windows")))]
+        #[cfg(all(
+            feature = "experimental",
+            any(target_os = "linux", target_os = "windows")
+        ))]
         {
             let ctk_blea = ctk.clone();
             tracker.spawn(async move {
