@@ -2,3 +2,4 @@ target/
 *.snap
 gen
 node_modules
+.claude/
