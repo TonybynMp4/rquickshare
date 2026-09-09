@@ -24,6 +24,13 @@
 //! removed when the fast path replaced it. See git history / the doc if the GATT
 //! full-advertisement milestone needs them back.
 
+// The builders below are the other half of the parsers this module exports:
+// nothing advertises us over BLE yet (issue #425 is only half done), so they
+// have no caller. Kept because they are the reference for the wire layouts
+// documented above, and deleting them would mean re-deriving them from a
+// logcat capture.
+#![allow(dead_code)]
+
 use sha2::{Digest, Sha256};
 
 fn sha256_prefix(data: &[u8], n: usize) -> Vec<u8> {

@@ -66,7 +66,7 @@ use crate::securemessage::{
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
 use crate::utils::{
     derive_d2d_keys, encode_point, gen_ecdsa_keypair, gen_random, get_download_dir,
-    stream_read_exact, to_four_digit_string, D2DKeys, DeviceType, RemoteDeviceInfo,
+    to_four_digit_string, D2DKeys, DeviceType, RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
@@ -1117,6 +1117,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
     }
 
     #[cfg(not(all(feature = "experimental", target_os = "windows")))]
+    #[allow(dead_code)] // stub for the configurations without a soft-AP
     async fn offer_wifi_hotspot_upgrade(&mut self) -> Result<(), anyhow::Error> {
         Ok(())
     }

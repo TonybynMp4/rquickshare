@@ -43,6 +43,7 @@ const MAX_PACKET_SIZE: u16 = 509;
 /// The 23-byte MTU every LE link must support, minus the ATT header. Slow, but
 /// it is the only size guaranteed to arrive, and a slow transfer beats a
 /// handshake that dies. Platforms that can report the real MTU never use this.
+#[allow(dead_code)] // no caller until a non-Windows MTU probe exists
 const FALLBACK_PACKET_SIZE: u16 = 20;
 
 /// The largest packet we can honestly say we are able to receive.

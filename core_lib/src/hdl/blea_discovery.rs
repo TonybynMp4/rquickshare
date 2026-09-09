@@ -339,6 +339,7 @@ impl Drop for AdvertisePause {
 }
 
 /// Is a BLE send running right now?
+#[allow(dead_code)] // for callers that need to avoid stepping on a send
 pub fn ble_send_in_progress() -> bool {
     BLE_SEND_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
