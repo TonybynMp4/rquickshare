@@ -21,49 +21,48 @@ This is a fork of [Martichou/rquickshare](https://github.com/Martichou/rquicksha
 Installation
 --------------------------
 
-There are no published releases of this fork yet, so for now you build it from source - see [BUILD.md](BUILD.md). The packages below are produced by that build.
+Download the installer for your system from the [latest release](https://github.com/asulwer/rquickshare/releases/latest). To build it yourself instead, see [BUILD.md](BUILD.md).
 
-**Important notes:**
-- The minimum GLIBC version supported is included in the Linux package name.
-  - You can check yours with `ldd --version`.
+The installers aren't code-signed yet, so Windows and macOS will warn you the first time - see below.
 
 #### Windows 11
 
-Run the installer (`.msi` or `-setup.exe`), or run `rquickshare.exe` directly.
+Run either installer: `r-quick-share-main_v<version>_x64_en-US.msi`, or `r-quick-share-main_v<version>_x64-setup.exe`.
 
-- Bluetooth is needed for transfers with a phone that isn't on your Wi-Fi network.
+- Windows SmartScreen may say it "protected your PC", because the installer isn't signed. Click **More info**, then **Run anyway**.
 - Windows Firewall will ask whether to allow rquickshare the first time it runs. Allow it on **Private** networks, otherwise your phone can't reach it over Wi-Fi.
+- Bluetooth is needed for transfers with a phone that isn't on your Wi-Fi network.
 
-#### macOS
+#### macOS (Apple Silicon)
 
-Simply install the .dmg.
+Open `r-quick-share-main_v<version>_aarch64.dmg` and drag the app to Applications. There is no Intel build at the moment.
 
-Note that you may have to first allow the app to install under `Settings > Privacy & Security > Security` (you should see a dialog asking for permission).
+Because the app isn't signed, macOS will block it the first time. Go to `System Settings > Privacy & Security`, scroll down to the message about rquickshare, and click **Open Anyway**.
 
 #### Linux
 
-##### Install dependencies
+The packages are built on Ubuntu 24.04, and the minimum GLIBC version they need is part of the file name (for example `glibc-2.39`). Check yours with `ldd --version`.
 
-RQuickShare requires one of the following libraries to be installed:
+RQuickShare also needs one of these libraries; the package manager normally installs it for you:
 
 - `libayatana-appindicator`
 - `libappindicator3`
 
-The packages should install those dependencies by themselves, but if this is not the case you may have to install them manually.
-
 ##### Debian / Ubuntu
 ```bash
-sudo dpkg -i r-quick-share_${VERSION}.deb
+sudo apt install ./r-quick-share-main_v*_amd64.deb
 ```
 
-##### DNF (preferred over RPM)
+`apt install` with a local file also installs any missing dependencies, which `dpkg -i` doesn't.
+
+##### Fedora / DNF
 ```bash
-sudo dnf install r-quick-share-${VERSION}.rpm
+sudo dnf install ./r-quick-share-main_v*.rpm
 ```
 
-##### RPM
+##### Other RPM-based distributions
 ```bash
-sudo rpm -i r-quick-share-${VERSION}.rpm
+sudo rpm -i r-quick-share-main_v*.rpm
 ```
 
 ---
