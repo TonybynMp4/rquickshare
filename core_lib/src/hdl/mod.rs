@@ -133,6 +133,10 @@ pub struct InnerState {
     pub pin_code: Option<String>,
     pub transfer_metadata: Option<TransferMetadata>,
     pub transferred_files: HashMap<i64, InternalFileInfo>,
+    // Names the inbound files are written under, in `TransferMetadata::files`
+    // order. They differ from the sender's names on a clash (`1_<name>`), and
+    // replace them in the metadata once the transfer finishes.
+    pub saved_files: Vec<String>,
 
     // Everything needed for encryption/decryption/verif
     pub cipher_commitment: Option<CipherCommitment>,

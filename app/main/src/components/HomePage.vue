@@ -119,11 +119,19 @@
 							</p>
 
 							<div class="flex flex-row justify-end gap-4 mt-1">
+								<!-- Multi-file "Open" already falls back to the folder, so only
+								     offer it when it does something "Open folder" doesn't. -->
 								<p
-									v-if="item.destination || (item.text_type === 'Url' && item.text_payload)"
+									v-if="(item.destination && item.files?.length === 1) || (item.text_type === 'Url' && item.text_payload)"
 									@click.stop="openTransfer(item)"
 									class="btn px-3 rounded-xl active:scale-95 transition duration-150 ease-in-out shadow-none">
 									Open
+								</p>
+								<p
+									v-if="item.destination && item.files?.length"
+									@click.stop="openFolder(item)"
+									class="btn px-3 rounded-xl active:scale-95 transition duration-150 ease-in-out shadow-none">
+									Open folder
 								</p>
 								<p
 									v-if="item.text_type && item.text_payload" @click.stop="writeToClipboard(item.text_payload)"
@@ -193,7 +201,7 @@ import { getStore } from "@tauri-apps/plugin-store";
 import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
 import { disable, enable } from '@tauri-apps/plugin-autostart';
 import { open as tauriDialog } from '@tauri-apps/plugin-dialog';
-import { openUrl as openExternalUrl, openPath } from '@tauri-apps/plugin-opener';
+import { openUrl as openExternalUrl, openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { join } from '@tauri-apps/api/path';
 import { writeText, readText } from '@tauri-apps/plugin-clipboard-manager';
 
@@ -628,6 +636,27 @@ export default {
 			} catch (e) {
 				this.toastStore.addToast("Could not open the received file", ToastType.Error);
 				console.error("Error opening transfer", e);
+			}
+		},
+		// "Open folder" on a received transfer. Reveal the received files so the
+		// file manager selects them (`files` holds the saved names once
+		// finished); if that fails, open the folder.
+		openFolder: async function(item: DisplayedItem) {
+			const destination = item.destination;
+			if (!destination) return;
+
+			try {
+				try {
+					const paths = await Promise.all((item.files ?? []).map((f) => join(destination, f)));
+					await revealItemInDir(paths);
+					return;
+				} catch (e) {
+					console.warn("Could not reveal the received files, opening their folder", e);
+				}
+				await openPath(destination);
+			} catch (e) {
+				this.toastStore.addToast("Could not open the download folder", ToastType.Error);
+				console.error("Error opening folder", e);
 			}
 		},
 	},
