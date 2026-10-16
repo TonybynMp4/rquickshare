@@ -1606,6 +1606,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                                 self.update_state(
                                     |e| {
                                         e.state = State::Finished;
+                                        // Report what's actually on disk, so the
+                                        // front can open/reveal the right file.
+                                        if let Some(tmd) = e.transfer_metadata.as_mut() {
+                                            tmd.files = Some(std::mem::take(&mut e.saved_files));
+                                        }
                                     },
                                     true,
                                 )
@@ -1922,6 +1927,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
 
                     info!("New destination: {:?}", dest);
                 }
+
+                self.state.saved_files.push(
+                    dest.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| file.name().to_owned()),
+                );
 
                 let info = InternalFileInfo {
                     payload_id: file.payload_id(),

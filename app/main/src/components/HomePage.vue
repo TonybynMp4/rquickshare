@@ -639,9 +639,8 @@ export default {
 			}
 		},
 		// "Open folder" on a received transfer. With a single file, reveal it so
-		// the file manager highlights it. That can fail if the core renamed it on
-		// a name clash (`files` keeps the sender's name), so fall back to opening
-		// the folder.
+		// the file manager highlights it (`files` holds the saved names once
+		// finished); if that fails, open the folder.
 		openFolder: async function(item: DisplayedItem) {
 			if (!item.destination) return;
 
