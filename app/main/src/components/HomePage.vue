@@ -638,23 +638,22 @@ export default {
 				console.error("Error opening transfer", e);
 			}
 		},
-		// "Open folder" on a received transfer. With a single file, reveal it so
-		// the file manager highlights it (`files` holds the saved names once
+		// "Open folder" on a received transfer. Reveal the received files so the
+		// file manager selects them (`files` holds the saved names once
 		// finished); if that fails, open the folder.
 		openFolder: async function(item: DisplayedItem) {
-			if (!item.destination) return;
+			const destination = item.destination;
+			if (!destination) return;
 
-			const files = item.files ?? [];
 			try {
-				if (files.length === 1) {
-					try {
-						await revealItemInDir(await join(item.destination, files[0]));
-						return;
-					} catch (e) {
-						console.warn("Could not reveal the received file, opening its folder", e);
-					}
+				try {
+					const paths = await Promise.all((item.files ?? []).map((f) => join(destination, f)));
+					await revealItemInDir(paths);
+					return;
+				} catch (e) {
+					console.warn("Could not reveal the received files, opening their folder", e);
 				}
-				await openPath(item.destination);
+				await openPath(destination);
 			} catch (e) {
 				this.toastStore.addToast("Could not open the download folder", ToastType.Error);
 				console.error("Error opening folder", e);
