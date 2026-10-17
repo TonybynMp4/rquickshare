@@ -108,7 +108,7 @@ dependencies:
   # --- Fonts ---
   - font-ttf-dejavu-sans-mono=2.37
   - font-ttf-inconsolata=3.0
-  - font-ttf-source-code-pro=2.3
+  - font-ttf-source-code-pro=2.038
   - font-ttf-ubuntu=0.83
 
   # --- Misc ---
