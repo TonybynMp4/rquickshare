@@ -135,6 +135,7 @@ cargo build --release
 
 ```bash
 cd app/main
+pnpm install tauri
 pnpm build
 ```
 
@@ -151,7 +152,7 @@ conda activate rquickshare && \
 export PKG_CONFIG_PATH="/home/user/miniconda3/envs/rquickshare/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig" && \
 export PKG_CONFIG_LIBDIR="/home/user/miniconda3/envs/rquickshare/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig" && \
 export RUSTFLAGS="-L /usr/lib/x86_64-linux-gnu" && \
-cd app/main && pnpm build
+pnpm install tauri && cd app/main && pnpm build
 ```
 
 <details>
