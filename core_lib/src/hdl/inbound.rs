@@ -774,21 +774,116 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         any(target_os = "linux", target_os = "windows")
     ))]
     fn lan_ipv4() -> Option<std::net::Ipv4Addr> {
-        get_if_addrs::get_if_addrs()
-            .ok()?
-            .into_iter()
-            .find_map(|i| match i.ip() {
-                std::net::IpAddr::V4(v4)
-                    if !v4.is_loopback()
-                        && !v4.is_link_local()
-                        && !(v4.octets()[0] == 192
-                            && v4.octets()[1] == 168
-                            && v4.octets()[2] == 137) =>
-                {
-                    Some(v4)
-                }
+        let is_usable_ip = |v4: &std::net::Ipv4Addr| -> bool {
+            let octets = v4.octets();
+            // Skip loopback (127.0.0.0/8)
+            if v4.is_loopback() {
+                return false;
+            }
+            // Skip link-local (169.254.0.0/16)
+            if v4.is_link_local() {
+                return false;
+            }
+            // Skip soft-AP tethering subnet (192.168.137.0/24)
+            if octets[0] == 192 && octets[1] == 168 && octets[2] == 137 {
+                return false;
+            }
+            // Skip CGNAT / Tailscale (100.64.0.0/10)
+            if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+                return false;
+            }
+            true
+        };
+
+        let is_virtual_name = |name: &str| -> bool {
+            let n = name.to_ascii_lowercase();
+            n.starts_with("lo")
+                || n.starts_with("tailscale")
+                || n.starts_with("tun")
+                || n.starts_with("tap")
+                || n.starts_with("wg")
+                || n.starts_with("docker")
+                || n.starts_with("veth")
+                || n.starts_with("br-")
+                || n.starts_with("virbr")
+                || n.starts_with("zt")
+        };
+
+        // Probe the kernel routing table for the primary outgoing IPv4 address.
+        // Connecting a UDP socket does not transmit any packets; it queries the OS
+        // routing table for the active default gateway/route.
+        let routed_ip = (|| {
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            socket.connect("8.8.8.8:80").ok()?;
+            match socket.local_addr().ok()?.ip() {
+                std::net::IpAddr::V4(v4) if is_usable_ip(&v4) => Some(v4),
                 _ => None,
-            })
+            }
+        })();
+
+        let if_addrs = get_if_addrs::get_if_addrs().ok()?;
+
+        let mut candidates: Vec<(i32, std::net::Ipv4Addr, String)> = Vec::new();
+
+        for iface in if_addrs {
+            let std::net::IpAddr::V4(v4) = iface.ip() else {
+                continue;
+            };
+
+            if !is_usable_ip(&v4) || is_virtual_name(&iface.name) {
+                continue;
+            }
+
+            let mut score = 0;
+            let name_lower = iface.name.to_ascii_lowercase();
+
+            // Strong preference for the interface matching the kernel default route
+            if Some(v4) == routed_ip {
+                score += 1000;
+            }
+
+            // Prioritize Wi-Fi interfaces: Quick Share transfers are primarily
+            // between wireless devices in local proximity.
+            if name_lower.starts_with("wl")
+                || name_lower.starts_with("wifi")
+                || name_lower.contains("wi-fi")
+                || name_lower.contains("wireless")
+                || name_lower.contains("wlan")
+            {
+                score += 100;
+            } else if name_lower.starts_with("en")
+                || name_lower.starts_with("eth")
+                || name_lower.contains("ethernet")
+            {
+                score += 40;
+            }
+
+            // Private IP ranges (RFC 1918)
+            let octets = v4.octets();
+            if octets[0] == 10
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+            {
+                score += 20;
+            }
+
+            candidates.push((score, v4, iface.name));
+        }
+
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if let Some((score, ip, ref name)) = candidates.first() {
+            info!(
+                "Bandwidth upgrade: selected LAN IPv4 {ip} on interface '{name}' (score {score})"
+            );
+            Some(*ip)
+        } else if let Some(ip) = routed_ip {
+            info!("Bandwidth upgrade: fallback to routed IPv4 {ip}");
+            Some(ip)
+        } else {
+            warn!("Bandwidth upgrade: no usable LAN IPv4 found");
+            None
+        }
     }
 
     /// Offer WIFI_LAN: the peer is already on our network, so just tell it where
@@ -2584,4 +2679,25 @@ pub(crate) async fn introduce_upgraded_channel(
     // channel. So there is nothing to do between the ACK and the swap, and
     // anything read here would be payload we then had to replay.
     Ok(socket)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(all(
+        feature = "experimental",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn test_lan_ipv4_resolves_valid_address() {
+        let ip = InboundRequest::<tokio::net::TcpStream>::lan_ipv4();
+        println!("Resolved LAN IPv4: {:?}", ip);
+        assert!(ip.is_some(), "Expected to find a valid LAN IPv4 address");
+        let v4 = ip.unwrap();
+        assert!(!v4.is_loopback());
+        assert!(!v4.is_link_local());
+        assert!(!(v4.octets()[0] == 192 && v4.octets()[1] == 168 && v4.octets()[2] == 137));
+        assert!(!(v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64));
+    }
 }
