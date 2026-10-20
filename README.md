@@ -85,6 +85,7 @@ Available here: [NixOS](https://search.nixos.org/packages?show=rquickshare&query
 ```bash
 nix-shell -p rquickshare
 ```
+
 </details>
 
 ---
@@ -161,8 +162,8 @@ You can give rquickshare a fixed port to allow in your firewall. Close the app, 
 
 ```json
 {
-	...existing_config...,
-	"port": 12345
+ ...existing_config...,
+ "port": 12345
 }
 ```
 
