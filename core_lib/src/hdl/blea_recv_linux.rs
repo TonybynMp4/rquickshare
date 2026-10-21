@@ -18,14 +18,21 @@ use bluer::{
 };
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::{uuid, Uuid};
 
 use super::ble_receiver;
+use super::Visibility;
 use crate::channel::ChannelMessage;
 
 const INNER_NAME: &str = "BleReceiverAdvertiser";
+
+// Advertise at roughly 1 s instead of the controller's default. The phone scans
+// at low latency while its share sheet is open, so it still finds us within a
+// second or two, and the radio is left free for other Bluetooth devices.
+const ADV_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+const ADV_MAX_INTERVAL: Duration = Duration::from_millis(1280);
 
 // Copresence service 0000FEF3-0000-1000-8000-00805F9B34FB.
 const COPRESENCE_SERVICE_UUID: Uuid = uuid!("0000fef3-0000-1000-8000-00805f9b34fb");
@@ -46,6 +53,7 @@ pub struct BleReceiverAdvertiser {
     device_type: u8,
     name: String,
     sender: tokio::sync::broadcast::Sender<ChannelMessage>,
+    visibility: watch::Receiver<Visibility>,
 }
 
 impl BleReceiverAdvertiser {
@@ -54,12 +62,14 @@ impl BleReceiverAdvertiser {
         device_type: u8,
         name: String,
         sender: tokio::sync::broadcast::Sender<ChannelMessage>,
+        visibility: watch::Receiver<Visibility>,
     ) -> Self {
         Self {
             endpoint_id,
             device_type,
             name,
             sender,
+            visibility,
         }
     }
 
@@ -361,14 +371,35 @@ impl BleReceiverAdvertiser {
         // Bluetooth 5 Extended Advertising which Android's legacy scanner cannot see).
         // Android discovers the receiver by seeing the 0xFEF3 Service UUID on air,
         // connects, and reads the full advertisement (name + endpoint) over GATT slot 0.
-        let le_advertisement = Advertisement {
+        let mut le_advertisement = Advertisement {
             advertisement_type: bluer::adv::Type::Peripheral,
             service_uuids: vec![COPRESENCE_SERVICE_UUID].into_iter().collect(),
             discoverable: Some(true),
+            min_interval: Some(ADV_MIN_INTERVAL),
+            max_interval: Some(ADV_MAX_INTERVAL),
             ..Default::default()
         };
-        let mut adv_handle = Some(adapter.advertise(le_advertisement.clone()).await?);
-        info!("{INNER_NAME}: legacy connectable GATT service advertising started under 0xFEF3");
+        // Hidden means hidden on BLE too, not only on mDNS. The GATT
+        // application stays registered either way; it costs no airtime.
+        let hidden = || *self.visibility.borrow() == Visibility::Invisible;
+        let mut adv_handle = if hidden() {
+            info!("{INNER_NAME}: hidden, not advertising until visible");
+            None
+        } else {
+            let h = match adapter.advertise(le_advertisement.clone()).await {
+                Ok(h) => h,
+                // An older BlueZ may refuse the interval; advertise at its
+                // default rather than not at all.
+                Err(e) => {
+                    warn!("{INNER_NAME}: advertising with a custom interval failed ({e}), using the default");
+                    le_advertisement.min_interval = None;
+                    le_advertisement.max_interval = None;
+                    adapter.advertise(le_advertisement.clone()).await?
+                }
+            };
+            info!("{INNER_NAME}: legacy connectable GATT service advertising started under 0xFEF3");
+            Some(h)
+        };
 
         // --- Supervisor: spawn a fresh Nearby session for each Weave connection ---
         let session_sender = self.sender.clone();
@@ -568,7 +599,7 @@ impl BleReceiverAdvertiser {
         });
 
         // --- Keep advertiser running and handle discovery pause ---
-        let mut adv_paused = false;
+        let mut adv_paused = adv_handle.is_none();
         loop {
             tokio::select! {
                 _ = ctk.cancelled() => {
@@ -578,21 +609,30 @@ impl BleReceiverAdvertiser {
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                    let want_paused = crate::hdl::ble_send_in_progress();
+                    // Dropping the advertisement does not disconnect a phone
+                    // already on the GATT server, so hiding mid-transfer is safe.
+                    let sending = crate::hdl::ble_send_in_progress();
+                    let want_paused = sending || hidden();
                     if want_paused != adv_paused {
                         if want_paused {
                             drop(adv_handle.take());
-                            info!("{INNER_NAME}: outbound BLE send in progress, pausing advertisement");
+                            if sending {
+                                info!("{INNER_NAME}: outbound BLE send in progress, pausing advertisement");
+                            } else {
+                                info!("{INNER_NAME}: hidden, pausing advertisement");
+                            }
+                            adv_paused = true;
                         } else {
                             match adapter.advertise(le_advertisement.clone()).await {
                                 Ok(h) => {
                                     adv_handle = Some(h);
-                                    info!("{INNER_NAME}: outbound BLE send finished, resumed advertisement");
+                                    adv_paused = false;
+                                    info!("{INNER_NAME}: resumed advertisement");
                                 }
+                                // Left paused, so the next tick retries.
                                 Err(e) => warn!("{INNER_NAME}: could not resume advertisement: {e}"),
                             }
                         }
-                        adv_paused = want_paused;
                     }
                 }
             }

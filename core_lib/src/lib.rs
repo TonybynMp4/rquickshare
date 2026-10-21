@@ -279,6 +279,7 @@ impl RQS {
                 crate::utils::DeviceType::Laptop as u8,
                 crate::utils::device_name(),
                 self.message_sender.clone(),
+                self.visibility_receiver.clone(),
             );
             let ctk = ctoken.clone();
             tracker.spawn(async move {
