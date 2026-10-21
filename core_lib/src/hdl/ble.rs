@@ -44,10 +44,12 @@ impl BleListener {
         info!("{INNER_NAME}: service starting");
 
         let mut events = self.adapter.events().await?;
-        // Filter on the NearyShare/QuickShare services UUID
-        let filter = ScanFilter {
-            services: vec![SERVICE_UUID_SHARING],
-        };
+        // Unfiltered. A sharing phone carries 0xFE2C only as service data, not
+        // in its service UUID list, and BlueZ's UUID filter matches the list -
+        // so a filtered scan never heard the phone unless some other client
+        // happened to be scanning unfiltered. The check below does the
+        // filtering instead. BlueZ filters on the host, so this costs no airtime.
+        let filter = ScanFilter::default();
         self.adapter.start_scan(filter.clone()).await?;
 
         let mut last_alert = SystemTime::UNIX_EPOCH;
@@ -78,9 +80,8 @@ impl BleListener {
                 Some(e) = events.next() => {
                     match e {
                         CentralEvent::ServiceDataAdvertisement { id, service_data } => {
-                            // Sanity check as per: https://github.com/Martichou/rquickshare/issues/74
-                            // Seems like the filtering is not enough, so we'll add a check before
-                            // proceeding with the service_data.
+                            // The scan is unfiltered, so this is the only filter.
+                            // See also https://github.com/Martichou/rquickshare/issues/74
                             if !service_data.contains_key(&SERVICE_UUID_SHARING) {
                                 continue;
                             }
