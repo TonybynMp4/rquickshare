@@ -8,7 +8,7 @@ laptop with an Intel combo Wi-Fi/Bluetooth chip, BlueZ 5.85 and a Pixel phone.
 
 ## The problem
 
-Bluetooth mice and keyboards lagged, and sometimes didn't reconnect, while
+A Bluetooth mouse sometimes dropped, and sometimes couldn't reconnect, while
 rquickshare was running. The listener used to keep a BlueZ discovery scan
 running for the life of the app. BlueZ only offers active scanning through
 discovery, and on a chip that shares one radio between Wi-Fi and Bluetooth, a
@@ -34,8 +34,8 @@ all the time, for example:
 ```
 
 Matching on 0xFE2C alone raised the alert for one of these beacons, which was
-in range for every test, including runs where no phone was sharing. The listener now requires `fc 12 8e` after the
-UUID. The phone carries 0xFE2C only as service data, not in its service UUID
+in range for every test, including runs where no phone was sharing. The
+listener now requires `fc 12 8e` after the UUID. The phone carries 0xFE2C only as service data, not in its service UUID
 list, so BlueZ's UUID scan filter never matches it. The scan runs unfiltered and
 the check happens in our code.
 
