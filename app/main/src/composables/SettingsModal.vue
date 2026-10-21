@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { loggingLevels, utils } from '../vue_lib';
-import { PropType, ref, watch } from 'vue';
+import { PropType, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { TauriVM } from '../vue_lib/helper/ParamsHelper';
 
 const props = defineProps({
@@ -48,94 +48,170 @@ function openDownloadPicker() {
 		await utils.setDownloadPath(props.vm, el as string);
 	});
 }
+
+const checked = (e: Event) => (e.target as HTMLInputElement).checked;
+
+const dialog = ref<HTMLElement | null>(null);
+// Whatever had focus when the dialog opened (the gear button), so closing
+// hands focus back instead of dropping it on <body>.
+let returnFocus: HTMLElement | null = null;
+
+watch(() => props.vm.settingsOpen, async (open) => {
+	if (open) {
+		returnFocus = document.activeElement as HTMLElement | null;
+		await nextTick();
+		dialog.value?.focus();
+	} else {
+		returnFocus?.focus();
+		returnFocus = null;
+	}
+});
+
+// Every way out goes through here. Closing removes the name field without
+// blurring it, so a name typed and then dismissed with Escape would otherwise
+// be lost; the Close button only kept it because clicking it blurred the field.
+async function close() {
+	await commitDeviceName();
+	emit('close');
+}
+
+function onKeydown(e: KeyboardEvent) {
+	if (!props.vm.settingsOpen) return;
+
+	if (e.key === 'Escape') {
+		e.preventDefault();
+		close();
+		return;
+	}
+
+	// Keep Tab inside the dialog: the page behind it is covered and can't be used.
+	if (e.key === 'Tab' && dialog.value) {
+		const focusable = Array.from(dialog.value.querySelectorAll<HTMLElement>('button, input, select'));
+		if (focusable.length === 0) return;
+
+		const first = focusable[0];
+		const last = focusable[focusable.length - 1];
+		const active = document.activeElement;
+		if (e.shiftKey && (active === first || active === dialog.value)) {
+			e.preventDefault();
+			last.focus();
+		} else if (!e.shiftKey && active === last) {
+			e.preventDefault();
+			first.focus();
+		}
+	}
+}
+
+onMounted(() => window.addEventListener('keydown', onKeydown));
+onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown));
 </script>
 
 <template>
-	<div v-if="vm.settingsOpen" class="absolute z-10 w-full h-full flex justify-center items-center bg-black bg-opacity-25">
-		<div class="bg-white dark:bg-neutral-800 rounded-xl shadow-xl p-4 w-[24rem]">
+	<div
+		v-if="vm.settingsOpen" class="absolute z-10 w-full h-full flex justify-center items-center bg-black bg-opacity-25"
+		@click.self="close()">
+		<div
+			ref="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"
+			tabindex="-1"
+			class="bg-white dark:bg-neutral-800 rounded-xl shadow-xl p-4 w-[26rem] max-h-[calc(100%-2rem)] overflow-y-auto focus:outline-none">
 			<div class="flex flex-row justify-between items-center">
-				<h3 class="font-medium text-xl">
+				<h3 id="settings-title" class="font-medium text-xl">
 					Settings
 				</h3>
-				<div class="btn px-3 rounded-xl active:scale-95 transition duration-150 ease-in-out" @click="emit('close')">
+				<button type="button" class="btn px-3 rounded-xl active:scale-95 transition duration-150 ease-in-out" @click="close()">
 					Close
-				</div>
+				</button>
 			</div>
-			<div class="py-4 flex flex-col">
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="flex flex-col items-start gap-1">
-						<span class="flex flex-row justify-between items-center w-full">
-							<span class="label-text">Device name</span>
-							<span
-								v-if="vm.deviceNameOverride" class="text-xs cursor-pointer select-none underline opacity-70
-								transition duration-150 ease-in-out hover:opacity-100 active:opacity-40"
-								@click="resetDeviceName()">
-								Reset
-							</span>
-						</span>
-						<input
-							v-model="nameDraft" type="text" :placeholder="vm.hostnameDefault ?? 'This device'"
-							maxlength="64"
-							class="w-full rounded-xl bg-white dark:bg-neutral-700 border border-gray-500 border-opacity-30 px-2 py-1 text-sm focus:outline-none"
-							@blur="commitDeviceName()" @keyup.enter="commitDeviceName()">
-						<span class="text-xs opacity-70">
-							What nearby devices show. Empty follows the hostname.
-						</span>
-					</label>
-				</div>
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="pressable flex flex-row justify-between items-center" @click="utils.setAutoStart(vm, !vm.autostart)">
-						<span class="label-text">Start on boot</span>
-						<input type="checkbox" :checked="vm.autostart" class="checkbox focus:outline-none">
-					</label>
-				</div>
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="pressable flex flex-row justify-between items-center" @click="utils.setRealClose(vm, !vm.realclose)">
-						<span class="label-text">Keep running on close</span>
-						<input type="checkbox" :checked="!vm.realclose" class="checkbox focus:outline-none">
-					</label>
-				</div>
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="pressable flex flex-row justify-between items-center" @click="utils.setStartMinimized(vm, !vm.startminimized)">
-						<span class="label-text">Start minimized</span>
-						<input type="checkbox" :checked="vm.startminimized" class="checkbox focus:outline-none">
-					</label>
-				</div>
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="pressable flex flex-row justify-between items-center" @click="utils.setClipboardAutosync(vm, !vm.clipboardAutosync)">
-						<span class="label-text">Auto-stage clipboard text</span>
-						<input type="checkbox" :checked="vm.clipboardAutosync" class="checkbox focus:outline-none">
-					</label>
-				</div>
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="flex flex-row justify-between items-center gap-3">
-						<span class="flex flex-col items-start">
-							<span class="label-text">Logging level</span>
-							<span class="text-xs opacity-70">Applies immediately. Use "trace" to capture a problem.</span>
-						</span>
-						<select
-							class="rounded-xl bg-white dark:bg-neutral-700 border border-gray-500 border-opacity-30 px-2 py-1 text-sm cursor-pointer focus:outline-none"
-							:value="vm.debugLevel"
-							@change="utils.setLoggingLevel(vm, ($event.target as HTMLSelectElement).value)">
-							<!-- The popup is drawn by the OS, so the options need their own
-							     colours - inheriting leaves black-on-dark in dark mode. -->
-							<option
-								v-for="level in loggingLevels" :key="level" :value="level"
-								class="bg-white text-gray-900 dark:bg-neutral-700 dark:text-gray-200">
-								{{ level }}
-							</option>
-						</select>
-					</label>
-				</div>
-				<div class="form-control hover:bg-gray-500 hover:bg-opacity-10 rounded-xl p-3">
-					<label class="pressable flex flex-col items-start" @click="openDownloadPicker()">
-						<span class="">Change download folder</span>
-						<span class="overflow-hidden whitespace-nowrap text-ellipsis text-xs max-w-80">
-							> {{ vm.downloadPath ?? 'OS User\'s download folder' }}
-						</span>
-					</label>
-				</div>
+
+			<h4 class="settings-section">
+				Device
+			</h4>
+			<div class="settings-row !flex-col !items-start !gap-1">
+				<span class="flex flex-row justify-between items-center w-full">
+					<label for="settings-device-name">Device name</label>
+					<button
+						v-if="vm.deviceNameOverride" type="button" class="text-xs underline opacity-70
+						transition duration-150 ease-in-out hover:opacity-100 active:opacity-40"
+						@click="resetDeviceName()">
+						Reset
+					</button>
+				</span>
+				<input
+					id="settings-device-name" v-model="nameDraft" type="text" :placeholder="vm.hostnameDefault ?? 'This device'"
+					maxlength="64" aria-describedby="settings-device-name-hint"
+					class="settings-field w-full"
+					@blur="commitDeviceName()" @keyup.enter="commitDeviceName()">
+				<span id="settings-device-name-hint" class="text-xs opacity-70">
+					What nearby devices show. Leave empty to use the hostname.
+				</span>
 			</div>
+			<div class="settings-row">
+				<span class="flex flex-col min-w-0">
+					<span>Save received files to</span>
+					<span class="text-xs opacity-70 overflow-hidden whitespace-nowrap text-ellipsis" :title="vm.downloadPath">
+						{{ vm.downloadPath ?? 'Your Downloads folder' }}
+					</span>
+				</span>
+				<button type="button" class="btn !h-9 !min-h-9 px-3 shrink-0" @click="openDownloadPicker()">
+					Change…
+				</button>
+			</div>
+
+			<h4 class="settings-section">
+				Startup
+			</h4>
+			<label class="settings-row cursor-pointer">
+				<span>Start on boot</span>
+				<input
+					type="checkbox" role="switch" class="switch" :checked="vm.autostart"
+					@change="utils.setAutoStart(vm, checked($event))">
+			</label>
+			<label class="settings-row cursor-pointer">
+				<span>Start minimized</span>
+				<input
+					type="checkbox" role="switch" class="switch" :checked="vm.startminimized"
+					@change="utils.setStartMinimized(vm, checked($event))">
+			</label>
+			<label class="settings-row cursor-pointer">
+				<span class="flex flex-col">
+					<span>Keep running when closed</span>
+					<span class="text-xs opacity-70">Closing the window leaves RQuickShare in the tray, ready to receive.</span>
+				</span>
+				<input
+					type="checkbox" role="switch" class="switch" :checked="!vm.realclose"
+					@change="utils.setRealClose(vm, !checked($event))">
+			</label>
+
+			<h4 class="settings-section">
+				Advanced
+			</h4>
+			<label class="settings-row cursor-pointer">
+				<span class="flex flex-col">
+					<span>Auto-stage clipboard text</span>
+					<span class="text-xs opacity-70">New text you copy is staged to send, so you only pick a device.</span>
+				</span>
+				<input
+					type="checkbox" role="switch" class="switch" :checked="vm.clipboardAutosync"
+					@change="utils.setClipboardAutosync(vm, checked($event))">
+			</label>
+			<label class="settings-row">
+				<span class="flex flex-col">
+					<span>Logging level</span>
+					<span class="text-xs opacity-70">Applies immediately. Use "trace" to capture a problem.</span>
+				</span>
+				<select
+					class="settings-field cursor-pointer"
+					:value="vm.debugLevel"
+					@change="utils.setLoggingLevel(vm, ($event.target as HTMLSelectElement).value)">
+					<!-- The popup is drawn by the OS, so the options need their own
+					     colours - inheriting leaves black-on-dark in dark mode. -->
+					<option
+						v-for="level in loggingLevels" :key="level" :value="level"
+						class="bg-white text-gray-900 dark:bg-neutral-700 dark:text-gray-200">
+						{{ level }}
+					</option>
+				</select>
+			</label>
 		</div>
 	</div>
 </template>

@@ -175,31 +175,49 @@ body,
 	@apply cursor-pointer select-none transition duration-150 ease-in-out active:scale-[0.99]
 }
 
-.checkbox {
-    flex-shrink: 0;
-    --chkbg: var(--fallback-bc, oklch(var(--bc) / 1));
-    --chkfg: var(--fallback-b1, oklch(var(--b1) / 1));
-    height: 1.5rem;
-    width: 1.5rem;
-    cursor: pointer;
-    -webkit-appearance: none;
-    -moz-appearance: none;
-    appearance: none;
-    border-radius: var(--rounded-btn, 0.5rem);
-    border-width: 1px;
-    border-color: var(--fallback-bc, oklch(var(--bc) / var(--tw-border-opacity)));
-    --tw-border-opacity: .2;
+.settings-section {
+	@apply mt-4 mb-1 px-3 text-xs font-medium uppercase tracking-wide opacity-60
 }
 
-.checkbox:checked, .checkbox[checked=true], .checkbox[aria-checked=true] {
-    background-repeat: no-repeat;
-    animation: checkmark var(--animation-input, .2s) ease-out;
-    background-color: #bbf7d0;
-    background-image: linear-gradient(-45deg, transparent 65%, #bbf7d0 65.99%), linear-gradient(45deg, transparent 75%, #bbf7d0 75.99%), linear-gradient(-45deg, #bbf7d0 40%, transparent 40.99%), linear-gradient(45deg, #bbf7d0 30%, black 30.99%, black 40%, transparent 40.99%), linear-gradient(-45deg, black 50%, #bbf7d0 50.99%);
+.settings-row {
+	@apply flex flex-row justify-between items-center gap-3 rounded-xl p-3
+		hover:bg-gray-500 hover:bg-opacity-10
 }
 
-.checkbox:checked, .checkbox[checked=true], .checkbox[aria-checked=true] {
-	@apply bg-green-200 border-green-200 text-black;
+.settings-field {
+	@apply rounded-xl bg-white dark:bg-neutral-700 border border-gray-500 border-opacity-30 px-2 py-1 text-sm
+		focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500
+}
+
+/* WebKitGTK draws a native <select> with the GTK theme (bigger, its own
+   border and arrow), so drop that and draw the chevron here instead. The grey
+   reads on both the light and dark field. */
+select.settings-field {
+	@apply appearance-none pr-8;
+	background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='%23a3a3a3'%3E%3Cpath d='M5.5 7.5 10 12l4.5-4.5z'/%3E%3C/svg%3E");
+	background-repeat: no-repeat;
+	background-position: right 0.5rem center;
+	background-size: 1.25rem;
+}
+
+/* On/off switch drawn on a plain checkbox, so it keeps native keyboard and
+   label behaviour. The knob is a background layer rather than a ::before,
+   which not every webview renders on an <input>. */
+.switch {
+	@apply shrink-0 h-5 w-9 rounded-full cursor-pointer bg-neutral-300 dark:bg-neutral-600
+		transition-all duration-150 ease-in-out
+		focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500 focus-visible:ring-offset-2
+		dark:focus-visible:ring-offset-neutral-800;
+	appearance: none;
+	background-image: radial-gradient(circle, #fff 0 0.5rem, transparent calc(0.5rem + 1px));
+	background-size: 1.25rem 1.25rem;
+	background-repeat: no-repeat;
+	background-position: left center;
+}
+
+.switch:checked {
+	@apply bg-green-600;
+	background-position: right center;
 }
 
 .circular-progress {
