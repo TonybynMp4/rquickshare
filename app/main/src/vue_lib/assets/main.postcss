@@ -267,7 +267,9 @@ body,
     .status-indicator--success .circle-secondary { background: rgba(229, 231, 235, 0.1); }
     .status-indicator--success .circle-tertiary { background: rgba(229, 231, 235, 0.4); }
 
-    /* Circular progress ring. */
-    .circular-progress circle.bg { stroke: #3f3f46; }
+    /* Circular progress ring. The track has to stand apart from both the
+       neutral-700 card and the neutral-800 icon disc it surrounds, or the
+       unfilled part of the ring disappears. */
+    .circular-progress circle.bg { stroke: #737373; }
     .circular-progress circle.fg { stroke: #e5e7eb; }
 }
