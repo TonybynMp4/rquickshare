@@ -69,7 +69,10 @@ the check happens in our code.
 The phone changes address every few seconds, so the monitor and the watcher
 report a stream of short-lived devices for one share. The alert goes out when
 the first one is found, and not again until all of them are lost, which
-happens 10 s after the phone's last advertisement. The Linux scan counts an
+happens 10 s after the phone's last advertisement. After bluetoothd restarts,
+BlueZ can remove a device before reporting it lost and then drops the report,
+so the monitor also counts an address as lost when BlueZ removes the device.
+The Linux scan counts an
 address as lost when its service data changes to something else, or when
 BlueZ removes the device, 30 s after its last advertisement. The macOS scan has no lost event, so it treats the share as
 over after 10 s with no sharing advertisement.

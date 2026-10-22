@@ -223,7 +223,9 @@ impl BleListener {
         info!("{INNER_NAME}: listening with a passive advertisement monitor");
 
         // BlueZ keeps the monitor across a power cycle, but doesn't report
-        // the addresses it was tracking as lost.
+        // the addresses it was tracking as lost. Nor does it when it removed
+        // the device first, which happens after bluetoothd restarts, so a
+        // removed device counts as lost too.
         let mut adapter_events = adapter.events().await?;
         let mut sharing = ShareTracker::default();
         loop {
@@ -249,11 +251,13 @@ impl BleListener {
                     // active scan for good.
                     None => return Err(anyhow!("BlueZ released the advertisement monitor")),
                 },
-                Some(event) = adapter_events.next() => {
-                    if let bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(false)) = event {
+                Some(event) = adapter_events.next() => match event {
+                    bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(false)) => {
                         sharing.clear();
                     }
-                }
+                    bluer::AdapterEvent::DeviceRemoved(address) => sharing.lost(&address),
+                    _ => {}
+                },
             }
         }
     }
