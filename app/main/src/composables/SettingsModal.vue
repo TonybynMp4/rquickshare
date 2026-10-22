@@ -199,7 +199,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown));
 					<span>Notify me when a nearby device is sharing</span>
 					<span class="text-xs opacity-70">
 						Also shows this device right away to a phone that starts sharing; with it off, that can take up to a minute.
-						On Linux without BlueZ's experimental features, it can stop Bluetooth mice and keyboards from reconnecting.
+						On macOS, and on Linux without BlueZ's experimental features, it can stop Bluetooth mice and keyboards from reconnecting.
 					</span>
 				</span>
 				<input
