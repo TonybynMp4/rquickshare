@@ -386,17 +386,7 @@ impl BleReceiverAdvertiser {
             info!("{INNER_NAME}: hidden, not advertising until visible");
             None
         } else {
-            let h = match adapter.advertise(le_advertisement.clone()).await {
-                Ok(h) => h,
-                // An older BlueZ may refuse the interval; advertise at its
-                // default rather than not at all.
-                Err(e) => {
-                    warn!("{INNER_NAME}: advertising with a custom interval failed ({e}), using the default");
-                    le_advertisement.min_interval = None;
-                    le_advertisement.max_interval = None;
-                    adapter.advertise(le_advertisement.clone()).await?
-                }
-            };
+            let h = advertise(&adapter, &mut le_advertisement).await?;
             info!("{INNER_NAME}: legacy connectable GATT service advertising started under 0xFEF3");
             Some(h)
         };
@@ -623,7 +613,7 @@ impl BleReceiverAdvertiser {
                             }
                             adv_paused = true;
                         } else {
-                            match adapter.advertise(le_advertisement.clone()).await {
+                            match advertise(&adapter, &mut le_advertisement).await {
                                 Ok(h) => {
                                     adv_handle = Some(h);
                                     adv_paused = false;
@@ -644,6 +634,27 @@ impl BleReceiverAdvertiser {
 
 /// Slices `bytes` into chunks of at most 508 bytes, adds a Weave data header,
 /// and queues each chunk via `send_pkt`.
+/// Advertise, falling back to BlueZ's default interval if it refuses ours. An
+/// older BlueZ may; advertising at the default beats not advertising. The
+/// fallback sticks, so a resume after hiding doesn't retry the refused one.
+async fn advertise(
+    adapter: &bluer::Adapter,
+    advertisement: &mut Advertisement,
+) -> bluer::Result<bluer::adv::AdvertisementHandle> {
+    match adapter.advertise(advertisement.clone()).await {
+        Ok(h) => Ok(h),
+        Err(e) if advertisement.min_interval.is_some() => {
+            warn!(
+                "{INNER_NAME}: advertising with a custom interval failed ({e}), using the default"
+            );
+            advertisement.min_interval = None;
+            advertisement.max_interval = None;
+            adapter.advertise(advertisement.clone()).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn frame_weave(bytes: &[u8], tx_counter: &AtomicU8, send_pkt: &Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
     let max_payload = 508usize;
     let chunks: Vec<&[u8]> = bytes.chunks(max_payload).collect();
