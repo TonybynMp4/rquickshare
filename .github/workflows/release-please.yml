@@ -17,7 +17,7 @@ jobs:
   # The release PR still relies on "Allow GitHub Actions to create and approve
   # pull requests" (Settings > Actions > General).
   release_please:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: write
