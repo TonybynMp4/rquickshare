@@ -1,48 +1,60 @@
-use std::time::Duration;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::collections::HashSet;
 
+#[cfg(not(target_os = "windows"))]
 use anyhow::anyhow;
+#[cfg(not(target_os = "windows"))]
 use btleplug::api::{Central, CentralEvent, Manager as _, ScanFilter};
+#[cfg(not(target_os = "windows"))]
 use btleplug::platform::{Adapter, Manager};
+#[cfg(not(target_os = "windows"))]
 use futures::stream::StreamExt;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::watch;
-use tokio::time::Instant;
+#[cfg(not(target_os = "windows"))]
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+#[cfg(not(target_os = "windows"))]
 use uuid::{uuid, Uuid};
 
+#[cfg(not(target_os = "windows"))]
 const SERVICE_UUID_SHARING: Uuid = uuid!("0000fe2c-0000-1000-8000-00805f9b34fb");
 // 0xFE2C is Google's Fast Pair UUID, also carried by Find My Device beacons
 // and similar that are always around. A phone that's sharing puts Quick
 // Share's model ID 0xFC128E first in it.
+#[cfg(not(target_os = "windows"))]
 const SHARING_PREFIX: [u8; 3] = [0xfc, 0x12, 0x8e];
+// The same match for the platform filters, as AD type 0x16 ("Service Data -
+// 16-bit UUID") content: the UUID first, little-endian, then the prefix.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const AD_TYPE_SERVICE_DATA_16: u8 = 0x16;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const SHARING_SERVICE_DATA: [u8; 5] = [0x2c, 0xfe, 0xfc, 0x12, 0x8e];
 
 const INNER_NAME: &str = "BleListener";
 
-// Scan in short bursts rather than continuously. A continuous scan holds the
-// radio for the life of the app, which on a combo Wi-Fi/Bluetooth chip starves
-// other Bluetooth devices (mice lag). A sharing phone repeats its 0xFE2C
-// advertisement several times a second for as long as its share sheet is open,
-// so a 5 s window still catches it - the only cost is the "nearby" alert
-// arriving up to SCAN_OFF later.
-const SCAN_ON: Duration = Duration::from_secs(5);
-const SCAN_OFF: Duration = Duration::from_secs(10);
-
-// Don't spam, max one alert per 30s
-const ALERT_INTERVAL: Duration = Duration::from_secs(30);
+// How long a phone stays "sharing" after its last advert. Used directly by the
+// scan, and as the lost timeout given to the BlueZ monitor and Windows watcher.
+const GONE_AFTER_SECS: u64 = 10;
 
 /// Raises "a nearby device is sharing" when a phone opens its share sheet.
 ///
-/// Even duty-cycled, the scan is active (BlueZ discovery offers nothing else)
-/// and while it runs the controller can't take reconnections from Bluetooth
-/// mice and keyboards. So on Linux it first tries a BlueZ advertisement
-/// monitor, which the kernel serves with a passive scan, and only scans when
-/// BlueZ doesn't provide one (it's behind bluetoothd's experimental flag). It
-/// also stands down entirely while the user has the alert turned off.
+/// A sharing phone takes a new random address every few seconds, so each
+/// address only lives briefly. The alert goes out when the first one appears
+/// and not again until every one of them is gone: once per share, not once
+/// per address.
+///
+/// An active scan keeps the controller from taking reconnections from
+/// Bluetooth mice and keyboards, so this listens passively where the platform
+/// can: a BlueZ advertisement monitor on Linux (behind bluetoothd's
+/// experimental flag) and a passive advertisement watcher on Windows. Anywhere
+/// else it falls back to a continuous scan. It stands down entirely while the
+/// user has the alert turned off.
 pub struct BleListener {
+    #[cfg(not(target_os = "windows"))]
     adapter: Adapter,
     sender: Sender<()>,
     enabled: watch::Receiver<bool>,
-    last_alert: Option<Instant>,
 }
 
 impl BleListener {
@@ -50,17 +62,21 @@ impl BleListener {
         sender: Sender<()>,
         enabled: watch::Receiver<bool>,
     ) -> Result<Self, anyhow::Error> {
-        let manager = Manager::new().await?;
-        let adapters = manager.adapters().await?;
-        if adapters.is_empty() {
-            return Err(anyhow!("no bluetooth adapter"));
-        }
+        #[cfg(not(target_os = "windows"))]
+        let adapter = {
+            let manager = Manager::new().await?;
+            let adapters = manager.adapters().await?;
+            adapters
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("no bluetooth adapter"))?
+        };
 
         Ok(Self {
-            adapter: adapters[0].clone(),
+            #[cfg(not(target_os = "windows"))]
+            adapter,
             sender,
             enabled,
-            last_alert: None,
         })
     }
 
@@ -91,6 +107,9 @@ impl BleListener {
                 Err(e) => warn!("{INNER_NAME}: advertisement monitor failed: {e}"),
             }
 
+            #[cfg(target_os = "windows")]
+            self.watch(&ctk).await?;
+            #[cfg(not(target_os = "windows"))]
             self.scan(&ctk).await?;
         }
 
@@ -117,19 +136,17 @@ impl BleListener {
         // Declared after `manager` so it drops first, as bluer requires.
         let mut handle = match manager
             .register(Monitor {
-                // AD type 0x16 is "Service Data - 16-bit UUID"; the UUID comes
-                // first, little-endian, then the data.
                 patterns: Some(vec![Pattern::new(
-                    0x16,
+                    AD_TYPE_SERVICE_DATA_16,
                     0,
-                    &[&[0x2c, 0xfe][..], &SHARING_PREFIX].concat(),
+                    &SHARING_SERVICE_DATA,
                 )]),
-                // Found on the first advert from any phone in range, lost after
-                // 10 s of silence, so each share sheet opening counts once.
+                // BlueZ reports an address found on its first advert in range
+                // and lost after GONE_AFTER_SECS without one.
                 rssi_high_threshold: Some(-100),
                 rssi_high_timeout: Some(Duration::from_secs(1)),
                 rssi_low_threshold: Some(-127),
-                rssi_low_timeout: Some(Duration::from_secs(10)),
+                rssi_low_timeout: Some(Duration::from_secs(GONE_AFTER_SECS)),
                 ..Default::default()
             })
             .await
@@ -142,14 +159,7 @@ impl BleListener {
         };
         info!("{INNER_NAME}: listening with a passive advertisement monitor");
 
-        // BlueZ reports a device once when it comes in range, not on every
-        // advert, so an alert held back by the rate limit never gets a second
-        // chance. Track who's still sharing and retry when the limit lifts.
-        let mut sharing = std::collections::HashSet::new();
-        let mut held_back = false;
-        let retry = tokio::time::sleep(Duration::ZERO);
-        tokio::pin!(retry);
-
+        let mut sharing = HashSet::new();
         loop {
             tokio::select! {
                 _ = ctk.cancelled() => return Ok(true),
@@ -157,20 +167,13 @@ impl BleListener {
                     info!("{INNER_NAME}: turned off, releasing the advertisement monitor");
                     return Ok(true);
                 }
-                _ = &mut retry, if held_back => {
-                    held_back = false;
-                    if let Some(&device) = sharing.iter().next() {
-                        self.alert(device);
-                    }
-                }
                 event = handle.next() => match event {
                     Some(MonitorEvent::DeviceFound(id)) => {
                         trace!("{INNER_NAME}: monitor found {}", id.device);
-                        sharing.insert(id.device);
-                        if !self.alert(id.device) {
-                            held_back = true;
-                            retry.as_mut().reset(self.next_alert());
+                        if sharing.is_empty() {
+                            self.alert(id.device);
                         }
+                        sharing.insert(id.device);
                     }
                     Some(MonitorEvent::DeviceLost(id)) => {
                         trace!("{INNER_NAME}: monitor lost {}", id.device);
@@ -186,7 +189,127 @@ impl BleListener {
         }
     }
 
-    /// Listen with a duty-cycled scan until cancelled or turned off.
+    /// Listen with a passive advertisement watcher until cancelled or turned
+    /// off. Windows matches the sharing service data itself, and its signal
+    /// strength filter reports a phone gone with one last advert at -127 dBm.
+    #[cfg(target_os = "windows")]
+    async fn watch(&mut self, ctk: &CancellationToken) -> Result<(), anyhow::Error> {
+        use windows::core::Interface;
+        use windows::Devices::Bluetooth::Advertisement::{
+            BluetoothLEAdvertisementBytePattern, BluetoothLEAdvertisementReceivedEventArgs,
+            BluetoothLEAdvertisementWatcher, BluetoothLEAdvertisementWatcherStoppedEventArgs,
+            BluetoothLEScanningMode,
+        };
+        use windows::Foundation::{IReference, PropertyValue, TimeSpan, TypedEventHandler};
+        use windows::Storage::Streams::DataWriter;
+
+        const OUT_OF_RANGE_DBM: i16 = -127;
+
+        enum Event {
+            Advert { address: u64, rssi: i16 },
+            Stopped(i32),
+        }
+
+        let watcher = BluetoothLEAdvertisementWatcher::new()?;
+        watcher.SetScanningMode(BluetoothLEScanningMode::Passive)?;
+
+        let data = DataWriter::new()?;
+        data.WriteBytes(&SHARING_SERVICE_DATA)?;
+        let pattern = BluetoothLEAdvertisementBytePattern::Create(
+            AD_TYPE_SERVICE_DATA_16,
+            0,
+            &data.DetachBuffer()?,
+        )?;
+        watcher
+            .AdvertisementFilter()?
+            .BytePatterns()?
+            .Append(&pattern)?;
+
+        // Like the BlueZ monitor: in range from -100 dBm, gone after
+        // GONE_AFTER_SECS without an advert.
+        let strength = watcher.SignalStrengthFilter()?;
+        strength.SetInRangeThresholdInDBm(
+            &PropertyValue::CreateInt16(-100)?.cast::<IReference<i16>>()?,
+        )?;
+        strength.SetOutOfRangeThresholdInDBm(
+            &PropertyValue::CreateInt16(-110)?.cast::<IReference<i16>>()?,
+        )?;
+        strength.SetOutOfRangeTimeout(
+            &PropertyValue::CreateTimeSpan(TimeSpan {
+                // In 100 ns units.
+                Duration: GONE_AFTER_SECS as i64 * 10_000_000,
+            })?
+            .cast::<IReference<TimeSpan>>()?,
+        )?;
+
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let on_advert = tx.clone();
+        let received = watcher.Received(&TypedEventHandler::<
+            BluetoothLEAdvertisementWatcher,
+            BluetoothLEAdvertisementReceivedEventArgs,
+        >::new(move |_, args| {
+            if let Some(args) = args.as_ref() {
+                let _ = on_advert.send(Event::Advert {
+                    address: args.BluetoothAddress()?,
+                    rssi: args.RawSignalStrengthInDBm()?,
+                });
+            }
+            Ok(())
+        }))?;
+        let stopped = watcher.Stopped(&TypedEventHandler::<
+            BluetoothLEAdvertisementWatcher,
+            BluetoothLEAdvertisementWatcherStoppedEventArgs,
+        >::new(move |_, args| {
+            if let Some(args) = args.as_ref() {
+                let _ = tx.send(Event::Stopped(args.Error()?.0));
+            }
+            Ok(())
+        }))?;
+
+        watcher.Start()?;
+        info!("{INNER_NAME}: listening with a passive advertisement watcher");
+
+        let mut sharing = HashSet::new();
+        let result = loop {
+            tokio::select! {
+                _ = ctk.cancelled() => break Ok(()),
+                _ = turned_off(&mut self.enabled) => {
+                    info!("{INNER_NAME}: turned off, stopping the advertisement watcher");
+                    break Ok(());
+                }
+                Some(event) = events.recv() => match event {
+                    Event::Advert { address, rssi: OUT_OF_RANGE_DBM } => {
+                        trace!("{INNER_NAME}: watcher lost {address:012x}");
+                        sharing.remove(&address);
+                    }
+                    Event::Advert { address, .. } => {
+                        if sharing.is_empty() {
+                            self.alert(format_args!("{address:012x}"));
+                        }
+                        sharing.insert(address);
+                    }
+                    // Bluetooth was turned off, or the radio went away.
+                    Event::Stopped(error) => {
+                        break Err(anyhow::anyhow!(
+                            "advertisement watcher stopped (BluetoothError {error})"
+                        ));
+                    }
+                }
+            }
+        };
+
+        let _ = watcher.RemoveReceived(received);
+        let _ = watcher.RemoveStopped(stopped);
+        let _ = watcher.Stop();
+        result
+    }
+
+    /// Listen with a continuous scan until cancelled or turned off.
+    ///
+    /// The fallback when nothing passive is available. It's an active scan, so
+    /// while it runs Bluetooth mice and keyboards may not reconnect - the cost
+    /// the setting's description warns about.
+    #[cfg(not(target_os = "windows"))]
     async fn scan(&mut self, ctk: &CancellationToken) -> Result<(), anyhow::Error> {
         let mut events = self.adapter.events().await?;
         // Unfiltered. A sharing phone carries 0xFE2C only as service data, not
@@ -194,14 +317,12 @@ impl BleListener {
         // so a filtered scan never heard the phone unless some other client
         // happened to be scanning unfiltered. The check below does the
         // filtering instead. BlueZ filters on the host, so this costs no airtime.
-        let filter = ScanFilter::default();
-        self.adapter.start_scan(filter.clone()).await?;
-        info!("{INNER_NAME}: listening with a duty-cycled scan");
+        self.adapter.start_scan(ScanFilter::default()).await?;
+        info!("{INNER_NAME}: listening with a continuous scan");
 
-        let mut scanning = true;
-        let toggle = tokio::time::sleep(SCAN_ON);
-        tokio::pin!(toggle);
-
+        // A scan never reports an address gone, so the share counts as over
+        // once no sharing advert has arrived for GONE_AFTER_SECS.
+        let mut last_heard: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = ctk.cancelled() => break,
@@ -209,61 +330,34 @@ impl BleListener {
                     info!("{INNER_NAME}: turned off, stopping the scan");
                     break;
                 }
-                _ = &mut toggle => {
-                    if scanning {
-                        if let Err(e) = self.adapter.stop_scan().await {
-                            warn!("{INNER_NAME}: could not pause scanning: {e}");
-                        }
-                        toggle.as_mut().reset(Instant::now() + SCAN_OFF);
-                    } else {
-                        if let Err(e) = self.adapter.start_scan(filter.clone()).await {
-                            warn!("{INNER_NAME}: could not resume scanning: {e}");
-                        }
-                        toggle.as_mut().reset(Instant::now() + SCAN_ON);
-                    }
-                    scanning = !scanning;
-                }
                 Some(e) = events.next() => {
-                    // The scan is unfiltered, so this is the only filter.
                     // See also https://github.com/Martichou/rquickshare/issues/74
                     if let CentralEvent::ServiceDataAdvertisement { id, service_data } = e {
                         if service_data
                             .get(&SERVICE_UUID_SHARING)
                             .is_some_and(|data| data.starts_with(&SHARING_PREFIX))
                         {
-                            let _ = self.alert(id);
+                            let now = Instant::now();
+                            let gone = Duration::from_secs(GONE_AFTER_SECS);
+                            if last_heard.is_none_or(|t| now - t >= gone) {
+                                self.alert(id);
+                            }
+                            last_heard = Some(now);
                         }
                     }
                 }
             }
         }
 
-        if scanning {
-            let _ = self.adapter.stop_scan().await;
-        }
+        let _ = self.adapter.stop_scan().await;
 
         Ok(())
     }
 
-    /// Alert unless one went out within ALERT_INTERVAL. Returns whether it did.
-    fn alert(&mut self, who: impl std::fmt::Display) -> bool {
-        if self
-            .last_alert
-            .is_some_and(|last| last.elapsed() < ALERT_INTERVAL)
-        {
-            return false;
-        }
-
+    fn alert(&self, who: impl std::fmt::Display) {
         debug!("{INNER_NAME}: A device ({who}) is sharing nearby");
         // Errs only when nobody listens, and then there's no one to tell.
         let _ = self.sender.send(());
-        self.last_alert = Some(Instant::now());
-        true
-    }
-
-    fn next_alert(&self) -> Instant {
-        self.last_alert
-            .map_or_else(Instant::now, |last| last + ALERT_INTERVAL)
     }
 }
 

@@ -51,15 +51,24 @@ the check happens in our code.
    controllers with Microsoft's vendor extension (MSFT) do the matching in
    firmware. That passive scan is the same one the kernel uses to wait for a
    paired mouse, so mice and keyboards reconnect normally.
-3. **Otherwise, a duty-cycled scan.** 5 s on, 10 s off. A sharing phone repeats
-   its advertisement several times a second, so a 5 s window catches it. The
-   alert can arrive up to 10 s late, and a mouse that drops during the 5 s
-   window still has to wait.
+3. **On Windows, a passive advertisement watcher.** A
+   `BluetoothLEAdvertisementWatcher` in passive mode, with a byte pattern on
+   the same AD type 0x16 data. Its signal strength filter reports a phone gone
+   with one last advertisement at -127 dBm.
+4. **Otherwise, a continuous scan.** This is the case on Linux when BlueZ has
+   no monitor, and on macOS. It's an active scan, so while it runs a mouse
+   that drops may not reconnect. Turning the setting off is the way out.
 
-The alert goes out at most once every 30 s. The monitor reports a device once
-when it comes in range, not on every advertisement, so a report that arrives
-inside the 30 s window is kept, and the alert goes out when the window ends if
-that phone is still in range.
+The phone changes address every few seconds, so the monitor and the watcher
+report a stream of short-lived devices for one share. The alert goes out when
+the first one is found, and not again until all of them are lost, which
+happens 10 s after the phone's last advertisement. The scan has no lost event,
+so it treats the share as over after 10 s with no sharing advertisement.
+
+The listener does a second job: while you're visible, each alert makes the
+mDNS service re-announce at once, so the sharing phone lists this device right
+away. With the setting off, the phone has to wait for the periodic re-announce,
+which runs every minute.
 
 ## Why the monitor isn't on by default
 
@@ -125,8 +134,8 @@ Run `sudo btmon -T > /tmp/btmon.txt` and start rquickshare with
 `RUST_LOG=trace`.
 
 - The log says which mode is active: `listening with a passive advertisement
-  monitor` or `listening with a duty-cycled scan`. With the alert on, each
-  phone found or lost shows up as `monitor found <address>` or `monitor lost
+  monitor` or `listening with a continuous scan`. With the alert on, each
+  address found or lost shows up as `monitor found <address>` or `monitor lost
   <address>`.
 - `grep -E "Type: (Active|Passive)" /tmp/btmon.txt | sort | uniq -c` shows the
   scan types. With the monitor there should only be passive ones.
