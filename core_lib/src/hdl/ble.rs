@@ -12,10 +12,7 @@ use btleplug::platform::{Adapter, Manager};
 use futures::stream::StreamExt;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::watch;
-#[cfg(not(target_os = "windows"))]
-use tokio::time::Duration;
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 #[cfg(not(target_os = "windows"))]
 use uuid::{uuid, Uuid};
@@ -41,6 +38,11 @@ const INNER_NAME: &str = "BleListener";
 // goes by.
 const GONE_AFTER_SECS: u64 = 10;
 
+// After listening fails, wait this long before trying again, doubling on each
+// failure in a row up to RETRY_MAX.
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Raises "a nearby device is sharing" when a phone opens its share sheet.
 ///
 /// A sharing phone takes a new random address every few seconds, so each
@@ -55,6 +57,8 @@ const GONE_AFTER_SECS: u64 = 10;
 /// else it falls back to a continuous scan. It stands down entirely while the
 /// user has the alert turned off.
 pub struct BleListener {
+    #[cfg(target_os = "linux")]
+    session: bluer::Session,
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     adapter: Adapter,
     sender: Sender<()>,
@@ -69,7 +73,11 @@ impl BleListener {
         enabled: watch::Receiver<bool>,
     ) -> Result<Self, anyhow::Error> {
         #[cfg(target_os = "linux")]
-        bluer::Session::new().await?.default_adapter().await?;
+        let session = {
+            let session = bluer::Session::new().await?;
+            session.default_adapter().await?;
+            session
+        };
 
         #[cfg(target_os = "windows")]
         {
@@ -97,6 +105,8 @@ impl BleListener {
         };
 
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            session,
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             adapter,
             sender,
@@ -107,6 +117,7 @@ impl BleListener {
     pub async fn run(mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
 
+        let mut retry = RETRY_MIN;
         loop {
             tokio::select! {
                 // Both are ready after a cancelled listen; stop rather than
@@ -124,15 +135,30 @@ impl BleListener {
                 }
             }
 
+            let started = Instant::now();
+            let Err(e) = self.listen(&ctk).await else {
+                retry = RETRY_MIN;
+                continue;
+            };
             // Usually Bluetooth being turned off. Wait for it to come back, or
             // for the user to turn the setting off and on, rather than ending
-            // the task and losing the alert until the app restarts.
-            if let Err(e) = self.listen(&ctk).await {
-                warn!("{INNER_NAME}: stopped listening ({e}), waiting for Bluetooth or the setting to change");
-                tokio::select! {
-                    _ = ctk.cancelled() => {}
-                    _ = turned_off(&mut self.enabled) => {}
-                    _ = powered_on() => info!("{INNER_NAME}: Bluetooth is back"),
+            // the task and losing the alert until the app restarts. The wait
+            // grows while listening keeps failing with Bluetooth on.
+            if started.elapsed() >= RETRY_MAX {
+                retry = RETRY_MIN;
+            }
+            warn!("{INNER_NAME}: stopped listening ({e}), waiting for Bluetooth or the setting to change");
+            #[cfg(target_os = "linux")]
+            let back = bluetooth_on(&self.session);
+            #[cfg(not(target_os = "linux"))]
+            let back = std::future::pending::<()>();
+            let wait = retry;
+            retry = (retry * 2).min(RETRY_MAX);
+            tokio::select! {
+                _ = ctk.cancelled() => {}
+                _ = turned_off(&mut self.enabled) => retry = RETRY_MIN,
+                _ = async { tokio::time::sleep(wait).await; back.await } => {
+                    info!("{INNER_NAME}: Bluetooth is on, listening again");
                 }
             }
         }
@@ -143,10 +169,8 @@ impl BleListener {
     /// Listen the best way the platform allows, until cancelled or turned off.
     async fn listen(&mut self, ctk: &CancellationToken) -> Result<(), anyhow::Error> {
         #[cfg(target_os = "linux")]
-        match self.monitor(ctk).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(e) => warn!("{INNER_NAME}: advertisement monitor failed: {e}"),
+        if self.monitor(ctk).await? {
+            return Ok(());
         }
 
         #[cfg(target_os = "windows")]
@@ -156,13 +180,13 @@ impl BleListener {
     }
 
     /// Listen through a BlueZ advertisement monitor until cancelled or turned
-    /// off. Returns `Ok(false)` when BlueZ can't monitor, so the caller scans.
+    /// off. Returns `Ok(false)` when BlueZ can't monitor, so the caller scans,
+    /// and an error when it stops, so the caller tries it again.
     #[cfg(target_os = "linux")]
     async fn monitor(&mut self, ctk: &CancellationToken) -> Result<bool, anyhow::Error> {
         use bluer::monitor::{Monitor, MonitorEvent, Pattern};
 
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = self.session.default_adapter().await?;
         // Fails unless bluetoothd runs with experimental features
         // (`Experimental = true` in /etc/bluetooth/main.conf).
         let manager = match adapter.monitor().await {
@@ -221,10 +245,9 @@ impl BleListener {
                         sharing.lost(&id.device);
                     }
                     Some(_) => {}
-                    None => {
-                        warn!("{INNER_NAME}: BlueZ released the advertisement monitor, falling back to scanning");
-                        return Ok(false);
-                    }
+                    // Try the monitor again, rather than fall back to the
+                    // active scan for good.
+                    None => return Err(anyhow!("BlueZ released the advertisement monitor")),
                 },
                 Some(event) = adapter_events.next() => {
                     if let bluer::AdapterEvent::PropertyChanged(bluer::AdapterProperty::Powered(false)) = event {
@@ -359,8 +382,7 @@ impl BleListener {
         use bluer::{AdapterEvent, DiscoveryFilter, DiscoveryTransport};
         use futures::stream::SelectAll;
 
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = self.session.default_adapter().await?;
         // LE only: BlueZ's default also runs classic inquiry, which holds the
         // radio far longer. No UUID filter: a sharing phone carries 0xFE2C
         // only as service data, not in its service UUID list, which is all
@@ -376,11 +398,12 @@ impl BleListener {
         let mut events = adapter.discover_devices().await?;
         info!("{INNER_NAME}: listening with a continuous scan");
 
-        // Each device's service data is read once when it appears, then
+        // Each device's service data is read once when it's first heard, then
         // followed through its change signals, which carry the new data, so
         // a device that starts sharing without changing address is caught
-        // without querying BlueZ again. BlueZ removes a device 30 s after its
-        // last advert, which ends its stream and counts as lost here.
+        // without querying BlueZ again. A device stops sharing when its data
+        // changes to something else, or when BlueZ removes it, 30 s after
+        // its last advert. Bonded devices are never removed.
         let mut service_data = SelectAll::new();
         let mut sharing = ShareTracker::default();
         loop {
@@ -403,7 +426,9 @@ impl BleListener {
                     None => return Err(anyhow!("BlueZ stopped the scan")),
                 },
                 Some((address, data)) = service_data.next() => {
-                    if carries_sharing(&data) && sharing.found(address) {
+                    if !carries_sharing(&data) {
+                        sharing.lost(&address);
+                    } else if sharing.found(address) {
                         self.alert(address);
                     }
                 }
@@ -510,9 +535,10 @@ impl<K: Eq + Hash> ShareTracker<K> {
     }
 }
 
-/// Follows a device's service data: what it is now, then each change, until
-/// BlueZ removes the device. The first read happens when the stream is first
-/// polled, so devices found together don't wait on each other.
+/// Follows a device's service data: what it is once the device is heard, then
+/// each change, until BlueZ removes the device. The first read happens when
+/// the stream is first polled, so devices found together don't wait on each
+/// other.
 #[cfg(target_os = "linux")]
 fn follow_service_data(
     device: bluer::Device,
@@ -523,7 +549,20 @@ fn follow_service_data(
     let address = device.address();
     futures::stream::once(async move {
         // Subscribe before reading, so a change in between isn't lost.
-        let changes = device.events().await.ok()?.filter_map(|event| {
+        let mut events = device.events().await.ok()?.boxed();
+        // A scan starts by listing every device BlueZ knows, in range or not,
+        // with the service data it last heard. Without a signal strength the
+        // device hasn't been heard in this scan, so that data may be from a
+        // share long over; wait for an advert.
+        if device.rssi().await.ok().flatten().is_none() {
+            while !matches!(
+                events.next().await?,
+                DeviceEvent::PropertyChanged(
+                    DeviceProperty::Rssi(_) | DeviceProperty::ServiceData(_)
+                )
+            ) {}
+        }
+        let changes = events.filter_map(|event| {
             futures::future::ready(match event {
                 DeviceEvent::PropertyChanged(DeviceProperty::ServiceData(data)) => Some(data),
                 _ => None,
@@ -545,24 +584,42 @@ fn carries_sharing(service_data: &std::collections::HashMap<Uuid, Vec<u8>>) -> b
         .is_some_and(|data| data.starts_with(&SHARING_PREFIX))
 }
 
-/// Resolves when the Bluetooth adapter is powered on again. Never, where
-/// that can't be watched.
-async fn powered_on() {
-    #[cfg(target_os = "linux")]
-    {
-        use bluer::{AdapterEvent, AdapterProperty};
+/// Resolves once the default Bluetooth adapter is there and powered on: right
+/// away if it is, or when it's powered on or appears, as after bluetoothd
+/// restarts.
+#[cfg(target_os = "linux")]
+async fn bluetooth_on(session: &bluer::Session) {
+    use bluer::{AdapterEvent, AdapterProperty, SessionEvent};
+    use futures::future::ready;
 
-        let events = async {
-            let session = bluer::Session::new().await?;
-            let adapter = session.default_adapter().await?;
-            // Keep the session alive with the stream.
-            bluer::Result::Ok((session, adapter.events().await?))
-        };
-        if let Ok((_session, mut events)) = events.await {
-            while let Some(event) = events.next().await {
-                if let AdapterEvent::PropertyChanged(AdapterProperty::Powered(true)) = event {
+    // Each check comes after the subscription, so a change in between isn't
+    // missed.
+    if let Ok(events) = session.events().await {
+        let mut added = events
+            .filter(|e| ready(matches!(e, SessionEvent::AdapterAdded(_))))
+            .boxed();
+        loop {
+            let mut powered = futures::stream::empty().boxed();
+            if let Ok(adapter) = session.default_adapter().await {
+                if let Ok(events) = adapter.events().await {
+                    powered = events
+                        .filter(|e| {
+                            ready(matches!(
+                                e,
+                                AdapterEvent::PropertyChanged(AdapterProperty::Powered(true))
+                            ))
+                        })
+                        .boxed();
+                }
+                if adapter.is_powered().await.unwrap_or(false) {
                     return;
                 }
+            }
+            tokio::select! {
+                Some(_) = powered.next() => return,
+                // Check the new adapter.
+                Some(_) = added.next() => {}
+                else => break,
             }
         }
     }

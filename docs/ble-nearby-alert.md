@@ -60,19 +60,26 @@ the check happens in our code.
    that drops may not reconnect. Turning the setting off is the way out. On
    Linux the scan is LE only, without BlueZ's default classic inquiry, and
    without duplicate reports, so BlueZ only signals a device when its data
-   changes. Each device's service data is read once when it appears and then
-   followed through those change signals, which carry the new data.
+   changes. Each device's service data is read once when the device is first
+   heard and then followed through those change signals, which carry the new
+   data. BlueZ also lists the devices it already knows when a scan starts,
+   with the data it last heard from them, so a device without a signal
+   strength waits for its next advert.
 
 The phone changes address every few seconds, so the monitor and the watcher
 report a stream of short-lived devices for one share. The alert goes out when
 the first one is found, and not again until all of them are lost, which
 happens 10 s after the phone's last advertisement. The Linux scan counts an
-address as lost when BlueZ removes the device, 30 s after its last
-advertisement. The macOS scan has no lost event, so it treats the share as
+address as lost when its service data changes to something else, or when
+BlueZ removes the device, 30 s after its last advertisement. The macOS scan has no lost event, so it treats the share as
 over after 10 s with no sharing advertisement.
 
 If Bluetooth is turned off, the listener stops and starts again when the
-adapter is powered back on (Linux) or when the setting is turned off and on.
+setting is turned off and on, or on Linux once the adapter is powered back on
+or reappears after bluetoothd restarts. If BlueZ drops the advertisement
+monitor, the listener registers it again rather than falling back to the
+scan. While listening keeps failing with Bluetooth on, it waits longer
+between attempts, from 5 s up to 5 minutes.
 
 The listener does a second job: while you're visible, each alert makes the
 mDNS service re-announce at once, so the sharing phone lists this device right

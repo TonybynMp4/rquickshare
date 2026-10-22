@@ -34,6 +34,9 @@ const INNER_NAME: &str = "BleReceiverAdvertiser";
 const ADV_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const ADV_MAX_INTERVAL: Duration = Duration::from_millis(1280);
 
+const RESUME_RETRY_MIN: Duration = Duration::from_secs(1);
+const RESUME_RETRY_MAX: Duration = Duration::from_secs(30);
+
 // Copresence service 0000FEF3-0000-1000-8000-00805F9B34FB.
 const COPRESENCE_SERVICE_UUID: Uuid = uuid!("0000fef3-0000-1000-8000-00805f9b34fb");
 
@@ -589,6 +592,10 @@ impl BleReceiverAdvertiser {
         });
 
         // --- Keep advertiser running and handle discovery pause ---
+        // A failed resume, e.g. with Bluetooth off, waits longer before each
+        // retry, up to RESUME_RETRY_MAX.
+        let mut resume_retry = Duration::ZERO;
+        let mut resume_at = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = ctk.cancelled() => {
@@ -610,14 +617,24 @@ impl BleReceiverAdvertiser {
                             } else {
                                 info!("{INNER_NAME}: hidden, pausing advertisement");
                             }
-                        } else {
+                        } else if tokio::time::Instant::now() >= resume_at {
                             match advertise(&adapter, &mut le_advertisement).await {
                                 Ok(h) => {
                                     adv_handle = Some(h);
+                                    resume_retry = Duration::ZERO;
                                     info!("{INNER_NAME}: resumed advertisement");
                                 }
-                                // Left paused, so the next tick retries.
-                                Err(e) => warn!("{INNER_NAME}: could not resume advertisement: {e}"),
+                                // Left paused, so a later tick retries. Only
+                                // the first failure in a row is a warning.
+                                Err(e) => {
+                                    if resume_retry.is_zero() {
+                                        warn!("{INNER_NAME}: could not resume advertisement ({e}), retrying");
+                                    } else {
+                                        debug!("{INNER_NAME}: could not resume advertisement: {e}");
+                                    }
+                                    resume_retry = (resume_retry * 2).clamp(RESUME_RETRY_MIN, RESUME_RETRY_MAX);
+                                    resume_at = tokio::time::Instant::now() + resume_retry;
+                                }
                             }
                         }
                     }
@@ -636,18 +653,19 @@ async fn advertise(
     adapter: &bluer::Adapter,
     advertisement: &mut Advertisement,
 ) -> bluer::Result<bluer::adv::AdvertisementHandle> {
-    match adapter.advertise(advertisement.clone()).await {
-        Ok(h) => Ok(h),
-        Err(e) if advertisement.min_interval.is_some() => {
-            warn!(
-                "{INNER_NAME}: advertising with a custom interval failed ({e}), using the default"
-            );
-            advertisement.min_interval = None;
-            advertisement.max_interval = None;
-            adapter.advertise(advertisement.clone()).await
-        }
-        Err(e) => Err(e),
+    let e = match adapter.advertise(advertisement.clone()).await {
+        Ok(h) => return Ok(h),
+        Err(e) => e,
+    };
+    // With Bluetooth off everything fails, and blaming the interval then
+    // would drop it for the rest of the session.
+    if advertisement.min_interval.is_none() || !adapter.is_powered().await.unwrap_or(false) {
+        return Err(e);
     }
+    warn!("{INNER_NAME}: advertising with a custom interval failed ({e}), using the default");
+    advertisement.min_interval = None;
+    advertisement.max_interval = None;
+    adapter.advertise(advertisement.clone()).await
 }
 
 /// Slices `bytes` into chunks of at most 508 bytes, adds a Weave data header,
