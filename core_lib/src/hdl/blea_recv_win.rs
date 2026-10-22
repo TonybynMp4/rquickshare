@@ -142,9 +142,6 @@ impl BleReceiverAdvertiser {
         device_type: u8,
         name: String,
         sender: tokio::sync::broadcast::Sender<crate::channel::ChannelMessage>,
-        // Not acted on yet: on Windows `StopAdvertising` drops connected GATT
-        // clients, so pausing on "hidden" could cut an inbound transfer.
-        _visibility: tokio::sync::watch::Receiver<super::Visibility>,
     ) -> Self {
         Self {
             endpoint_id,

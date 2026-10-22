@@ -289,6 +289,10 @@ impl RQS {
                 crate::utils::DeviceType::Laptop as u8,
                 crate::utils::device_name(),
                 self.message_sender.clone(),
+                // Linux pauses advertising while hidden. Windows doesn't:
+                // `StopAdvertising` drops connected GATT clients, so pausing
+                // there could cut an inbound transfer.
+                #[cfg(target_os = "linux")]
                 self.visibility_receiver.clone(),
             );
             let ctk = ctoken.clone();
