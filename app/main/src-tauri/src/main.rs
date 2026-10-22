@@ -11,13 +11,7 @@ use std::sync::{Arc, Mutex};
 use rqs_lib::channel::{ChannelDirection, ChannelMessage, TransferType};
 use rqs_lib::{EndpointInfo, SendInfo, State, Visibility, RQS};
 use store::get_startminimized;
-#[cfg(target_os = "macos")]
-use tauri::image::Image;
-use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
-    tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, Window, WindowEvent,
-};
+use tauri::{AppHandle, Emitter, Manager, Window, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::{broadcast, mpsc, watch, Mutex as AsyncMutex};
 
@@ -34,6 +28,7 @@ mod cmds;
 mod logger;
 mod notification;
 mod store;
+mod tray;
 
 pub struct AppState {
     pub message_sender: broadcast::Sender<ChannelMessage>,
@@ -91,41 +86,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
             // Initialize default values for the store
             init_default(app.app_handle());
+            store::reset_temporarily(app.app_handle());
 
-            // Initialize system Tray
-            let name = MenuItemBuilder::new("RQuickShare")
-                .enabled(false)
-                .build(app)?;
-            let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
-            let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
-            let menu = MenuBuilder::new(app)
-                .item(&name)
-                .separator()
-                .items(&[&show, &quit])
-                .build()?;
-
-            #[cfg(target_os = "macos")]
-            let icon = Image::from_bytes(include_bytes!("../icons/tray.png")).unwrap();
-            #[cfg(not(target_os = "macos"))]
-            let icon = app.default_window_icon().unwrap().clone();
-
-            let tray = TrayIconBuilder::new()
-                .icon(icon)
-                .menu(&menu)
-                .on_menu_event(move |app, event| match event.id().as_ref() {
-                    "show" => {
-                        trace!("tray_show");
-                        open_main_window(app);
-                    }
-                    "quit" => {
-                        trace!("tray_quit");
-                        kill_app(app.app_handle());
-                    }
-                    _ => (),
-                })
-                .build(app)?;
-
-            let _ = tray.set_icon_as_template(true);
+            tray::build_tray(app)?;
 
             // Fetch initial configuration values
             let visibility = get_visibility(app.app_handle());
@@ -332,8 +295,9 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
 
             match rinfo {
                 Ok(_) => {
-                    let v = visibility_receiver.borrow_and_update();
-                    let _ = set_visibility(&capp_handle, *v);
+                    let v = *visibility_receiver.borrow_and_update();
+                    let _ = set_visibility(&capp_handle, v);
+                    tray::show_visibility(&capp_handle, v);
                 }
                 Err(e) => {
                     error!("RecvError: visibility_receiver: {e}");

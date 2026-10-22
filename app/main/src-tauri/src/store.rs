@@ -67,6 +67,16 @@ pub fn set_visibility(app_handle: &AppHandle, v: Visibility) -> Result<(), anyho
     Ok(())
 }
 
+/// Temporarily's 60 s timer lives in the mDNS server and doesn't survive a
+/// restart, so quitting before it ran out would bring Temporarily back at the
+/// next launch. Start hidden instead, as the timer would have left it.
+pub fn reset_temporarily(app_handle: &AppHandle) {
+    if get_visibility(app_handle) == Visibility::Temporarily {
+        let store = _get_store(app_handle);
+        store.set("visibility", Visibility::Invisible as u8);
+    }
+}
+
 pub fn get_download_path(app_handle: &AppHandle) -> Option<PathBuf> {
     let store = _get_store(app_handle);
 
