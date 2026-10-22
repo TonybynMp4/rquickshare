@@ -50,9 +50,15 @@
 						</p>
 
 						<div v-if="item.state === 'WaitingForUserConsent'" class="flex-1 flex flex-col justify-between">
-							<p class="mt-4">
-								Wants to share {{ item.files?.join(', ') ?? item.text_description ?? 'some file(s).' }}
-							</p>
+							<div class="mt-2 min-w-0">
+								<template v-if="item.files?.length">
+									<p>Wants to share {{ pluralize(item.files.length, 'file') }}</p>
+									<FileList :files="item.files" />
+								</template>
+								<p v-else>
+									Wants to share {{ item.text_description ?? 'some text' }}
+								</p>
+							</div>
 							<div class="flex flex-row justify-end items-center gap-4 mt-1">
 								<!-- Once answered, the buttons are replaced rather than just
 									 styled as disabled. A second click starts a second transfer
@@ -88,9 +94,7 @@
 							<p class="mt-2" v-else>
 								Receiving...
 							</p>
-							<p v-for="f in item.files ?? []" :key="f" class="overflow-hidden whitespace-nowrap text-ellipsis">
-								{{ f }}
-							</p>
+							<FileList v-if="item.files?.length" :files="item.files" />
 							<div class="flex flex-row justify-end gap-4 mt-1">
 								<p
 									@click.stop="sendCmd(vm, item.id, 'CancelTransfer')" class="btn px-3
@@ -102,13 +106,13 @@
 
 						<div v-else-if="item.state === 'Finished'">
 							<p class="mt-2">
-								{{ item.transferType === 'Outbound' ? 'Sent' : 'Received' }} <span v-if="item.text_type">text</span>
+								{{ item.transferType === 'Outbound' ? 'Sent' : 'Received' }}
+								<span v-if="item.text_type">text</span>
+								<span v-else-if="item.files?.length">{{ pluralize(item.files.length, 'file') }}</span>
 							</p>
 
 							<!-- If files -->
-							<p v-for="f in item.files ?? []" :key="f" class="overflow-hidden whitespace-nowrap text-ellipsis">
-								{{ f }}
-							</p>
+							<FileList v-if="item.files?.length" :files="item.files" />
 							<p v-if="item.files && item.destination" class="mt-2 overflow-hidden whitespace-nowrap text-ellipsis">
 								Saved to {{ item.destination }}
 							</p>
@@ -218,6 +222,7 @@ import Heading from '../composables/Heading.vue';
 import SideMenu from '../composables/SideMenu.vue';
 import ContentStatus from '../composables/ContentStatus.vue';
 import ItemSide from '../composables/ItemSide.vue';
+import FileList from '../composables/FileList.vue';
 
 export default {
 	name: "HomePage",
@@ -228,7 +233,8 @@ export default {
 		Heading,
 		SideMenu,
 		ContentStatus,
-		ItemSide
+		ItemSide,
+		FileList
 	},
 
 	async setup() {
@@ -528,6 +534,9 @@ export default {
 				this.qrSvg = await invoke<string>('start_discovery');
 			}
 			this.discoveryRunning = true;
+		},
+		pluralize: function(n: number, noun: string): string {
+			return `${n} ${n === 1 ? noun : `${noun}s`}`;
 		},
 		writeToClipboard: async function(text: string) {
 			try {
