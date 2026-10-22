@@ -356,7 +356,10 @@ impl BleListener {
     /// the cost the setting's description warns about.
     #[cfg(target_os = "linux")]
     async fn scan(&mut self, ctk: &CancellationToken) -> Result<(), anyhow::Error> {
+        use std::collections::HashMap;
+
         use bluer::{AdapterEvent, DiscoveryFilter, DiscoveryTransport};
+        use futures::stream::SelectAll;
 
         let session = bluer::Session::new().await?;
         let adapter = session.default_adapter().await?;
@@ -375,11 +378,13 @@ impl BleListener {
         let mut events = adapter.discover_devices().await?;
         info!("{INNER_NAME}: listening with a continuous scan");
 
-        // A sharing phone advertises from a fresh address, so the first
-        // report of an address already carries its service data and each
-        // address needs checking once. BlueZ removes a device 30 s after its
+        // Each device's service data is read once when it appears, then
+        // followed through its change signals, which carry the new data, so
+        // a device that starts sharing without changing address is caught
+        // without querying BlueZ again. BlueZ removes a device 30 s after its
         // last advert, which is when a share counts as lost here.
-        let mut checked = HashSet::new();
+        let mut watching = HashMap::new();
+        let mut service_data_changes = SelectAll::new();
         let mut sharing = ShareTracker::default();
         loop {
             tokio::select! {
@@ -389,22 +394,30 @@ impl BleListener {
                     break;
                 }
                 event = events.next() => match event {
-                    Some(AdapterEvent::DeviceAdded(address)) => {
-                        if checked.insert(address)
-                            && is_sharing(&adapter, address).await
-                            && sharing.found(address)
-                        {
-                            self.alert(address);
+                    Some(AdapterEvent::DeviceAdded(address)) if !watching.contains_key(&address) => {
+                        if let Some((data, changes, stop)) = follow_service_data(&adapter, address).await {
+                            service_data_changes.push(changes);
+                            watching.insert(address, stop);
+                            if data.as_ref().is_some_and(carries_sharing) && sharing.found(address) {
+                                self.alert(address);
+                            }
                         }
                     }
                     Some(AdapterEvent::DeviceRemoved(address)) => {
-                        checked.remove(&address);
+                        if let Some(stop) = watching.remove(&address) {
+                            stop.abort();
+                        }
                         sharing.lost(&address);
                     }
                     Some(_) => {}
                     // Discovery stopped under us, e.g. the adapter was
                     // powered off.
                     None => return Err(anyhow!("BlueZ stopped the scan")),
+                },
+                Some((address, data)) = service_data_changes.next(), if !service_data_changes.is_empty() => {
+                    if carries_sharing(&data) && sharing.found(address) {
+                        self.alert(address);
+                    }
                 }
             }
         }
@@ -512,17 +525,38 @@ impl<K: Eq + Hash> ShareTracker<K> {
     }
 }
 
+/// Starts following a device's service data. Returns what it is now, its
+/// changes from here on, and a handle that ends them.
 #[cfg(target_os = "linux")]
-async fn is_sharing(adapter: &bluer::Adapter, address: bluer::Address) -> bool {
-    let Ok(device) = adapter.device(address) else {
-        return false;
-    };
-    device
-        .service_data()
-        .await
-        .ok()
-        .flatten()
-        .and_then(|data| data.get(&SERVICE_UUID_SHARING).cloned())
+async fn follow_service_data(
+    adapter: &bluer::Adapter,
+    address: bluer::Address,
+) -> Option<(
+    Option<std::collections::HashMap<Uuid, Vec<u8>>>,
+    impl futures::Stream<Item = (bluer::Address, std::collections::HashMap<Uuid, Vec<u8>>)>,
+    futures::stream::AbortHandle,
+)> {
+    use bluer::{DeviceEvent, DeviceProperty};
+
+    let device = adapter.device(address).ok()?;
+    // Subscribe before reading, so a change in between isn't lost.
+    let (events, stop) = futures::stream::abortable(device.events().await.ok()?);
+    let changes = events.filter_map(move |event| {
+        futures::future::ready(match event {
+            DeviceEvent::PropertyChanged(DeviceProperty::ServiceData(data)) => {
+                Some((address, data))
+            }
+            _ => None,
+        })
+    });
+    let data = device.service_data().await.ok().flatten();
+    Some((data, changes, stop))
+}
+
+#[cfg(target_os = "linux")]
+fn carries_sharing(service_data: &std::collections::HashMap<Uuid, Vec<u8>>) -> bool {
+    service_data
+        .get(&SERVICE_UUID_SHARING)
         .is_some_and(|data| data.starts_with(&SHARING_PREFIX))
 }
 

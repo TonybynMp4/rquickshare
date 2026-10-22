@@ -60,7 +60,8 @@ the check happens in our code.
    that drops may not reconnect. Turning the setting off is the way out. On
    Linux the scan is LE only, without BlueZ's default classic inquiry, and
    without duplicate reports, so BlueZ only signals a device when its data
-   changes.
+   changes. Each device's service data is read once when it appears and then
+   followed through those change signals, which carry the new data.
 
 The phone changes address every few seconds, so the monitor and the watcher
 report a stream of short-lived devices for one share. The alert goes out when
