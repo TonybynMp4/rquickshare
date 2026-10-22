@@ -20,7 +20,9 @@ use tokio::sync::broadcast;
 use super::{InboundRequest, OutboundPayload, OutboundRequest, State};
 use crate::securegcm::DeviceToDeviceMessage;
 use crate::securemessage::{HeaderAndBody, SecureMessage};
-use crate::utils::{derive_d2d_keys, to_four_digit_string, DeviceType, RemoteDeviceInfo};
+use crate::utils::{
+    decode_point, derive_d2d_keys, encode_point, to_four_digit_string, DeviceType, RemoteDeviceInfo,
+};
 
 /// Run the UKEY2 handshake to completion and hand back both sides for
 /// inspection.
@@ -180,6 +182,36 @@ fn kat_derives_the_keys_a_real_pixel_agreed_with() {
     assert_eq!(hex::encode(&keys.client_hmac_key), KAT_RECV_HMAC_KEY);
     assert_eq!(hex::encode(&keys.server_key), KAT_ENCRYPT_KEY);
     assert_eq!(hex::encode(&keys.server_hmac_key), KAT_SEND_HMAC_KEY);
+}
+
+/// A coordinate's signed encoding drops leading zero bytes (about one key in
+/// 128 has one) and gains a 0x00 sign byte when the top bit is set. Both must
+/// come back as the 32 bytes SEC1 needs, or the handshake fails with "point
+/// encoding error".
+#[test]
+fn ec_coordinates_survive_the_signed_encoding() {
+    let mut short = [0x5au8; 32];
+    short[0] = 0;
+    let mut high_bit = [0x5au8; 32];
+    high_bit[0] = 0x80;
+
+    for coordinate in [short, high_bit, [0; 32]] {
+        let encoded = encode_point(bytes::Bytes::copy_from_slice(&coordinate)).unwrap();
+        assert_eq!(decode_point(&encoded).unwrap(), coordinate);
+    }
+    assert_eq!(
+        encode_point(bytes::Bytes::copy_from_slice(&short))
+            .unwrap()
+            .len(),
+        31
+    );
+    assert_eq!(
+        encode_point(bytes::Bytes::copy_from_slice(&high_bit))
+            .unwrap()
+            .len(),
+        33
+    );
+    assert!(decode_point(&[0x01; 33]).is_err());
 }
 
 /// The phone displayed 7191 for this session; so must we, or the human
