@@ -34,9 +34,6 @@ const INNER_NAME: &str = "BleReceiverAdvertiser";
 const ADV_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const ADV_MAX_INTERVAL: Duration = Duration::from_millis(1280);
 
-const RESUME_RETRY_MIN: Duration = Duration::from_secs(1);
-const RESUME_RETRY_MAX: Duration = Duration::from_secs(30);
-
 // Copresence service 0000FEF3-0000-1000-8000-00805F9B34FB.
 const COPRESENCE_SERVICE_UUID: Uuid = uuid!("0000fef3-0000-1000-8000-00805f9b34fb");
 
@@ -384,8 +381,7 @@ impl BleReceiverAdvertiser {
         };
         // Hidden means hidden on BLE too, not only on mDNS. The GATT
         // application stays registered either way; it costs no airtime.
-        let hidden = || *self.visibility.borrow() == Visibility::Invisible;
-        let mut adv_handle = if hidden() {
+        let mut adv_handle = if *self.visibility.borrow() == Visibility::Invisible {
             info!("{INNER_NAME}: hidden, not advertising until visible");
             None
         } else {
@@ -592,11 +588,38 @@ impl BleReceiverAdvertiser {
         });
 
         // --- Keep advertiser running and handle discovery pause ---
-        // A failed resume, e.g. with Bluetooth off, waits longer before each
-        // retry, up to RESUME_RETRY_MAX.
-        let mut resume_retry = Duration::ZERO;
-        let mut resume_at = tokio::time::Instant::now();
+        // Advertise unless hidden or sending over BLE, following both as they
+        // change. A failed resume, e.g. with Bluetooth off, waits for
+        // Bluetooth to turn on, or for either of them to change.
+        let mut visibility = self.visibility.clone();
+        let mut sends = crate::hdl::ble_sends();
+        let mut resume_failed = false;
         loop {
+            let sending = *sends.borrow_and_update() > 0;
+            let hidden = *visibility.borrow_and_update() == Visibility::Invisible;
+            if sending || hidden {
+                // Dropping the advertisement does not disconnect a phone
+                // already on the GATT server, so hiding mid-transfer is safe.
+                if adv_handle.take().is_some() {
+                    if sending {
+                        info!("{INNER_NAME}: outbound BLE send in progress, pausing advertisement");
+                    } else {
+                        info!("{INNER_NAME}: hidden, pausing advertisement");
+                    }
+                }
+            } else if adv_handle.is_none() && !resume_failed {
+                match advertise(&adapter, &mut le_advertisement).await {
+                    Ok(h) => {
+                        adv_handle = Some(h);
+                        info!("{INNER_NAME}: resumed advertisement");
+                    }
+                    Err(e) => {
+                        warn!("{INNER_NAME}: could not resume advertisement ({e}), waiting for Bluetooth to turn on");
+                        resume_failed = true;
+                    }
+                }
+            }
+
             tokio::select! {
                 _ = ctk.cancelled() => {
                     info!("{INNER_NAME}: cancelled, stopping BLE receiver advertiser");
@@ -604,40 +627,10 @@ impl BleReceiverAdvertiser {
                     drop(app_handle);
                     break;
                 }
-                _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                    // Dropping the advertisement does not disconnect a phone
-                    // already on the GATT server, so hiding mid-transfer is safe.
-                    let sending = crate::hdl::ble_send_in_progress();
-                    let want_paused = sending || hidden();
-                    if want_paused != adv_handle.is_none() {
-                        if want_paused {
-                            drop(adv_handle.take());
-                            if sending {
-                                info!("{INNER_NAME}: outbound BLE send in progress, pausing advertisement");
-                            } else {
-                                info!("{INNER_NAME}: hidden, pausing advertisement");
-                            }
-                        } else if tokio::time::Instant::now() >= resume_at {
-                            match advertise(&adapter, &mut le_advertisement).await {
-                                Ok(h) => {
-                                    adv_handle = Some(h);
-                                    resume_retry = Duration::ZERO;
-                                    info!("{INNER_NAME}: resumed advertisement");
-                                }
-                                // Left paused, so a later tick retries. Only
-                                // the first failure in a row is a warning.
-                                Err(e) => {
-                                    if resume_retry.is_zero() {
-                                        warn!("{INNER_NAME}: could not resume advertisement ({e}), retrying");
-                                    } else {
-                                        debug!("{INNER_NAME}: could not resume advertisement: {e}");
-                                    }
-                                    resume_retry = (resume_retry * 2).clamp(RESUME_RETRY_MIN, RESUME_RETRY_MAX);
-                                    resume_at = tokio::time::Instant::now() + resume_retry;
-                                }
-                            }
-                        }
-                    }
+                Ok(()) = visibility.changed() => resume_failed = false,
+                Ok(()) = sends.changed() => resume_failed = false,
+                _ = super::ble::bluetooth_turned_on(&session), if resume_failed => {
+                    resume_failed = false;
                 }
             }
         }

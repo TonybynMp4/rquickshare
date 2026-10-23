@@ -5,14 +5,17 @@ use std::hash::Hash;
 
 use anyhow::anyhow;
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-use btleplug::api::{Central, CentralEvent, Manager as _, ScanFilter};
+use btleplug::api::{Central, CentralEvent, CentralState, Manager as _, ScanFilter};
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 use btleplug::platform::{Adapter, Manager};
 #[cfg(not(target_os = "windows"))]
 use futures::stream::StreamExt;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::watch;
-use tokio::time::{Duration, Instant};
+#[cfg(not(target_os = "windows"))]
+use tokio::time::Duration;
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 #[cfg(not(target_os = "windows"))]
 use uuid::{uuid, Uuid};
@@ -37,11 +40,6 @@ const INNER_NAME: &str = "BleListener";
 // given to the BlueZ monitor and the Windows watcher, and what the macOS scan
 // goes by.
 const GONE_AFTER_SECS: u64 = 10;
-
-// After listening fails, wait this long before trying again, doubling on each
-// failure in a row up to RETRY_MAX.
-const RETRY_MIN: Duration = Duration::from_secs(5);
-const RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// Raises "a nearby device is sharing" when a phone opens its share sheet.
 ///
@@ -117,7 +115,6 @@ impl BleListener {
     pub async fn run(mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
 
-        let mut retry = RETRY_MIN;
         loop {
             tokio::select! {
                 // Both are ready after a cancelled listen; stop rather than
@@ -135,31 +132,23 @@ impl BleListener {
                 }
             }
 
-            let started = Instant::now();
             let Err(e) = self.listen(&ctk).await else {
-                retry = RETRY_MIN;
                 continue;
             };
-            // Usually Bluetooth being turned off. Wait for it to come back, or
-            // for the user to turn the setting off and on, rather than ending
-            // the task and losing the alert until the app restarts. The wait
-            // grows while listening keeps failing with Bluetooth on.
-            if started.elapsed() >= RETRY_MAX {
-                retry = RETRY_MIN;
-            }
-            warn!("{INNER_NAME}: stopped listening ({e}), waiting for Bluetooth or the setting to change");
+            // Usually Bluetooth being turned off. Wait for it to come back on,
+            // or for the user to turn the setting off and on, rather than
+            // ending the task and losing the alert until the app restarts.
+            warn!("{INNER_NAME}: stopped listening ({e}), waiting for Bluetooth to turn on or the setting to change");
             #[cfg(target_os = "linux")]
-            let back = bluetooth_on(&self.session);
-            #[cfg(not(target_os = "linux"))]
-            let back = std::future::pending::<()>();
-            let wait = retry;
-            retry = (retry * 2).min(RETRY_MAX);
+            let back = bluetooth_turned_on(&self.session);
+            #[cfg(target_os = "windows")]
+            let back = bluetooth_turned_on();
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            let back = bluetooth_turned_on(&self.adapter);
             tokio::select! {
                 _ = ctk.cancelled() => {}
-                _ = turned_off(&mut self.enabled) => retry = RETRY_MIN,
-                _ = async { tokio::time::sleep(wait).await; back.await } => {
-                    info!("{INNER_NAME}: Bluetooth is on, listening again");
-                }
+                _ = turned_off(&mut self.enabled) => {}
+                _ = back => info!("{INNER_NAME}: Bluetooth turned on, listening again"),
             }
         }
 
@@ -464,9 +453,9 @@ impl BleListener {
                     info!("{INNER_NAME}: turned off, stopping the scan");
                     break;
                 }
-                Some(e) = events.next() => {
+                Some(e) = events.next() => match e {
                     // See also https://github.com/Martichou/rquickshare/issues/74
-                    if let CentralEvent::ServiceDataAdvertisement { id, service_data } = e {
+                    CentralEvent::ServiceDataAdvertisement { id, service_data } => {
                         if carries_sharing(&service_data) {
                             let now = Instant::now();
                             let gone = Duration::from_secs(GONE_AFTER_SECS);
@@ -476,6 +465,12 @@ impl BleListener {
                             last_heard = Some(now);
                         }
                     }
+                    // The scan doesn't survive Bluetooth going off; start it
+                    // again once it's back on.
+                    CentralEvent::StateUpdate(CentralState::PoweredOff) => {
+                        return Err(anyhow!("Bluetooth turned off"));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -588,20 +583,20 @@ fn carries_sharing(service_data: &std::collections::HashMap<Uuid, Vec<u8>>) -> b
         .is_some_and(|data| data.starts_with(&SHARING_PREFIX))
 }
 
-/// Resolves once the default Bluetooth adapter is there and powered on: right
-/// away if it is, or when it's powered on or appears, as after bluetoothd
-/// restarts.
+/// Resolves when Bluetooth comes on: the default adapter is powered on, or an
+/// adapter appears powered, as after bluetoothd restarts. Bluetooth already
+/// being on doesn't count, so whatever failed with it on waits for it to go
+/// off and on again rather than failing over and over.
 #[cfg(target_os = "linux")]
-async fn bluetooth_on(session: &bluer::Session) {
+pub(crate) async fn bluetooth_turned_on(session: &bluer::Session) {
     use bluer::{AdapterEvent, AdapterProperty, SessionEvent};
     use futures::future::ready;
 
-    // Each check comes after the subscription, so a change in between isn't
-    // missed.
     if let Ok(events) = session.events().await {
         let mut added = events
             .filter(|e| ready(matches!(e, SessionEvent::AdapterAdded(_))))
             .boxed();
+        let mut just_added = false;
         loop {
             let mut powered = futures::stream::empty().boxed();
             if let Ok(adapter) = session.default_adapter().await {
@@ -615,15 +610,88 @@ async fn bluetooth_on(session: &bluer::Session) {
                         })
                         .boxed();
                 }
-                if adapter.is_powered().await.unwrap_or(false) {
+                // Checked after subscribing, so a new adapter powering on in
+                // between isn't missed.
+                if just_added && adapter.is_powered().await.unwrap_or(false) {
                     return;
                 }
             }
             tokio::select! {
                 Some(_) = powered.next() => return,
-                // Check the new adapter.
-                Some(_) = added.next() => {}
+                Some(_) = added.next() => just_added = true,
                 else => break,
+            }
+        }
+    }
+
+    std::future::pending::<()>().await;
+}
+
+/// Resolves when Bluetooth turns on. Like on Linux, it being on already
+/// doesn't count.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+async fn bluetooth_turned_on(adapter: &Adapter) {
+    if let Ok(mut events) = adapter.events().await {
+        // Read after subscribing, so a change in between isn't missed.
+        let mut on = matches!(adapter.adapter_state().await, Ok(CentralState::PoweredOn));
+        while let Some(event) = events.next().await {
+            if let CentralEvent::StateUpdate(state) = event {
+                if state == CentralState::PoweredOn && !on {
+                    return;
+                }
+                on = state == CentralState::PoweredOn;
+            }
+        }
+    }
+
+    std::future::pending::<()>().await;
+}
+
+/// Resolves when the Bluetooth radio turns on. Like on Linux, it being on
+/// already doesn't count.
+#[cfg(target_os = "windows")]
+async fn bluetooth_turned_on() {
+    use windows::core::IInspectable;
+    use windows::Devices::Bluetooth::BluetoothAdapter;
+    use windows::Devices::Radios::{Radio, RadioState};
+    use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+
+    // Unregisters the handler however the wait ends.
+    struct Subscription(Radio, EventRegistrationToken);
+    impl Drop for Subscription {
+        fn drop(&mut self) {
+            let _ = self.0.RemoveStateChanged(self.1);
+        }
+    }
+
+    let radio = tokio::task::spawn_blocking(|| {
+        BluetoothAdapter::GetDefaultAsync()?
+            .get()?
+            .GetRadioAsync()?
+            .get()
+    })
+    .await;
+    if let Ok(Ok(radio)) = radio {
+        let (tx, mut states) = tokio::sync::mpsc::unbounded_channel();
+        // The handler isn't Send; the registration keeps its own reference.
+        let token = {
+            let handler = TypedEventHandler::<Radio, IInspectable>::new(move |radio, _| {
+                if let Some(radio) = radio.as_ref() {
+                    let _ = tx.send(radio.State()?);
+                }
+                Ok(())
+            });
+            radio.StateChanged(&handler)
+        };
+        if let Ok(token) = token {
+            let _subscription = Subscription(radio.clone(), token);
+            // Read after subscribing, so a change in between isn't missed.
+            let mut on = radio.State().is_ok_and(|s| s == RadioState::On);
+            while let Some(state) = states.recv().await {
+                if state == RadioState::On && !on {
+                    return;
+                }
+                on = state == RadioState::On;
             }
         }
     }

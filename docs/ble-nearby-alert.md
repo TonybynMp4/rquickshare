@@ -77,12 +77,15 @@ address as lost when its service data changes to something else, or when
 BlueZ removes the device, 30 s after its last advertisement. The macOS scan has no lost event, so it treats the share as
 over after 10 s with no sharing advertisement.
 
-If Bluetooth is turned off, the listener stops and starts again when the
-setting is turned off and on, or on Linux once the adapter is powered back on
-or reappears after bluetoothd restarts. If BlueZ drops the advertisement
-monitor, the listener registers it again rather than falling back to the
-scan. While listening keeps failing with Bluetooth on, it waits longer
-between attempts, from 5 s up to 5 minutes.
+If Bluetooth is turned off, the listener stops and starts again once
+Bluetooth is back on: the adapter is powered on or reappears after bluetoothd
+restarts on Linux, the radio turns on on Windows, or the adapter reports it's
+on on macOS. Turning the setting off and on also starts it again. If BlueZ
+drops the advertisement monitor, the listener registers it again once
+bluetoothd is back, rather than falling back to the scan. There's no timer: if
+listening fails with Bluetooth on, it waits for Bluetooth to go off and on
+again, or for the setting to change. The receiver advertisement works the same
+way: if resuming it fails, it tries again once Bluetooth turns on.
 
 The listener does a second job: while you're visible, each alert makes the
 mDNS service re-announce at once, so the sharing phone lists this device right
