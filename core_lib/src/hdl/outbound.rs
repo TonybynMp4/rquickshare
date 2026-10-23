@@ -42,8 +42,8 @@ use crate::sharing_nearby::{
     TextMetadata,
 };
 use crate::utils::{
-    derive_d2d_keys, encode_point, gen_ecdsa_keypair, gen_random, to_four_digit_string, D2DKeys,
-    DeviceType, RemoteDeviceInfo,
+    decode_point, derive_d2d_keys, encode_point, gen_ecdsa_keypair, gen_random,
+    to_four_digit_string, D2DKeys, DeviceType, RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
@@ -1792,17 +1792,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             .ok_or_else(|| anyhow!("Missing required fields"))?;
 
         let mut bytes = vec![0x04];
-        // Ensure no more than 32 bytes for the keys
-        if peer_p256_key.x.len() > 32 {
-            bytes.extend_from_slice(&peer_p256_key.x[peer_p256_key.x.len() - 32..]);
-        } else {
-            bytes.extend_from_slice(&peer_p256_key.x);
-        }
-        if peer_p256_key.y.len() > 32 {
-            bytes.extend_from_slice(&peer_p256_key.y[peer_p256_key.y.len() - 32..]);
-        } else {
-            bytes.extend_from_slice(&peer_p256_key.y);
-        }
+        bytes.extend_from_slice(&decode_point(&peer_p256_key.x)?);
+        bytes.extend_from_slice(&decode_point(&peer_p256_key.y)?);
 
         let encoded_point = Sec1Point::from_bytes(bytes)?;
         // `from_bytes` only validates the *encoding*; the point may still not lie

@@ -265,6 +265,25 @@ pub fn encode_point(unsigned: Bytes) -> Result<Vec<u8>, anyhow::Error> {
     Ok(big_int.to_signed_bytes_be())
 }
 
+/// Reads a coordinate written like `encode_point` (and by phones, which use
+/// Java's `BigInteger`) back into the 32 bytes a SEC1 point needs. The signed
+/// form can carry a leading 0x00 sign byte, and drops leading zero bytes, so
+/// about one coordinate in 256 arrives shorter than 32 bytes.
+pub fn decode_point(signed: &[u8]) -> Result<[u8; 32], anyhow::Error> {
+    let start = signed.iter().position(|&b| b != 0).unwrap_or(signed.len());
+    let magnitude = &signed[start..];
+    if magnitude.len() > 32 {
+        return Err(anyhow!(
+            "EC coordinate is {} bytes, more than 32",
+            magnitude.len()
+        ));
+    }
+
+    let mut coordinate = [0u8; 32];
+    coordinate[32 - magnitude.len()..].copy_from_slice(magnitude);
+    Ok(coordinate)
+}
+
 pub fn hkdf_extract_expand(
     salt: &[u8],
     input: &[u8],
