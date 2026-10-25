@@ -23,7 +23,10 @@ use std::sync::Mutex;
 
 use windows::core::HSTRING;
 use windows::Networking::Connectivity::NetworkInformation;
-use windows::Networking::NetworkOperators::{NetworkOperatorTetheringManager, TetheringWiFiBand};
+use windows::Networking::NetworkOperators::{
+    NetworkOperatorTetheringManager, TetheringOperationStatus, TetheringOperationalState,
+    TetheringWiFiBand,
+};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 /// Credentials for the started hotspot, mapped 1:1 to WifiHotspotCredentials.
@@ -73,7 +76,7 @@ impl WindowsHotspot {
             }
 
             let started = (|| -> Result<
-                (NetworkOperatorTetheringManager, HotspotCredentials),
+                (NetworkOperatorTetheringManager, SavedAccessPoint, HotspotCredentials),
                 anyhow::Error,
             > {
                 // Requires an active internet connection profile to share. With
@@ -83,7 +86,25 @@ impl WindowsHotspot {
                 let manager =
                     NetworkOperatorTetheringManager::CreateFromConnectionProfile(&profile)?;
 
+                // The user's own Mobile Hotspot may be running, with their
+                // devices on it. Reconfiguring it would knock those off, and
+                // stopping it afterwards would turn it off under them, so a
+                // hotspot that is already up is theirs and this path is skipped.
+                let state = manager.TetheringOperationalState()?;
+                if state == TetheringOperationalState::On
+                    || state == TetheringOperationalState::InTransition
+                {
+                    anyhow::bail!("the Mobile Hotspot is already in use; leaving it alone");
+                }
+
                 let config = manager.GetCurrentAccessPointConfiguration()?;
+                // Put back when the transfer is done, so the user's own hotspot
+                // keeps the name and password they gave it.
+                let saved = SavedAccessPoint {
+                    ssid: config.Ssid()?,
+                    passphrase: config.Passphrase()?,
+                    band: config.Band()?,
+                };
                 config.SetSsid(&HSTRING::from(ssid.as_str()))?;
                 config.SetPassphrase(&HSTRING::from(passphrase.as_str()))?;
 
@@ -107,13 +128,31 @@ impl WindowsHotspot {
 
                 manager.ConfigureAccessPointAsync(&config)?.join()?;
 
-                manager.StartTetheringAsync()?.join()?;
+                // The call succeeding only means Windows answered; whether the
+                // AP actually came up is in the result.
+                let started = (|| -> Result<(), anyhow::Error> {
+                    let result = manager.StartTetheringAsync()?.join()?;
+                    let status = result.Status()?;
+                    if status != TetheringOperationStatus::Success {
+                        let detail = result
+                            .AdditionalErrorMessage()
+                            .map(|m| m.to_string())
+                            .unwrap_or_default();
+                        anyhow::bail!("tethering did not start (status {}): {detail}", status.0);
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = started {
+                    restore_access_point(&manager, &saved);
+                    return Err(e);
+                }
 
                 let gateway =
                     hotspot_gateway_ip().unwrap_or_else(|| "192.168.137.1".to_string());
 
                 Ok((
                     manager,
+                    saved,
                     HotspotCredentials {
                         ssid: ssid.clone(),
                         passphrase: passphrase.clone(),
@@ -123,7 +162,7 @@ impl WindowsHotspot {
             })();
 
             match started {
-                Ok((manager, creds)) => {
+                Ok((manager, saved, creds)) => {
                     let _ = ready_tx.send(Ok(creds));
                     // Park until the handle is dropped. A recv error means the
                     // sender went away, which is the same signal.
@@ -132,6 +171,7 @@ impl WindowsHotspot {
                         Ok(_) => info!("WindowsHotspot: tethering stopped"),
                         Err(e) => warn!("WindowsHotspot: failed to stop tethering: {e}"),
                     }
+                    restore_access_point(&manager, &saved);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e.to_string()));
@@ -164,6 +204,28 @@ impl Drop for WindowsHotspot {
         if let Ok(tx) = self.stop_tx.lock() {
             let _ = tx.send(());
         }
+    }
+}
+
+/// The user's Mobile Hotspot settings from before we took it over.
+struct SavedAccessPoint {
+    ssid: HSTRING,
+    passphrase: HSTRING,
+    band: TetheringWiFiBand,
+}
+
+/// Gives the Mobile Hotspot back the name, password and band the user had.
+fn restore_access_point(manager: &NetworkOperatorTetheringManager, saved: &SavedAccessPoint) {
+    let restored = (|| -> windows::core::Result<()> {
+        let config = manager.GetCurrentAccessPointConfiguration()?;
+        config.SetSsid(&saved.ssid)?;
+        config.SetPassphrase(&saved.passphrase)?;
+        config.SetBand(saved.band)?;
+        manager.ConfigureAccessPointAsync(&config)?.join()
+    })();
+    match restored {
+        Ok(()) => info!("WindowsHotspot: restored the user's Mobile Hotspot settings"),
+        Err(e) => warn!("WindowsHotspot: could not restore the Mobile Hotspot settings: {e}"),
     }
 }
 
