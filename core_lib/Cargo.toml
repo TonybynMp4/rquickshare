@@ -35,11 +35,6 @@ windows = { version = "0.62", features = [
     "Foundation",
     "Foundation_Collections",
     "Win32_System_Com",
-    # Read the WiFi Direct group owner's operating channel. WinRT's
-    # WiFiDirectAdvertisement exposes no channel/frequency, so drop to the Win32
-    # WLAN API (WlanEnumInterfaces + WlanQueryInterface) for it.
-    "Win32_NetworkManagement_WiFi",
-    "Win32_Foundation",
 ], optional = true }
 # AsyncOperationCompletedHandler and the IAsync* types live here since
 # windows 0.59; `windows` uses them but doesn't re-export the handler.

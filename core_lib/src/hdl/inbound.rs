@@ -115,9 +115,6 @@ pub struct InboundRequest<S> {
         any(target_os = "linux", target_os = "windows")
     ))]
     switch_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
-    /// When we last answered a KeepAlive, so redundant responses can be skipped.
-    /// Not transport-specific, but it matters on BLE: see the KeepAlive arm.
-    last_keepalive_response: Option<std::time::Instant>,
     /// When we last broadcast a receive-progress update. A per-chunk broadcast
     /// floods the shared ChannelMessage bus - thousands of messages during a
     /// fast transfer - overflowing its 50-slot buffer so this handler's own
@@ -175,7 +172,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             wifi_direct: None,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             wifi_direct_creds: None,
-            last_keepalive_response: None,
             last_progress_broadcast: None,
             prof_decrypt: std::time::Duration::ZERO,
             prof_aes: std::time::Duration::ZERO,
@@ -542,7 +538,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         self.update_state(
             |e| {
                 e.private_key = Some(secret_key);
-                e.public_key = Some(public_key);
                 e.server_init_data = Some(server_init_data.clone());
             },
             false,
@@ -1736,8 +1731,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                 // backlog to clear - the indications were confirming one at a
                 // time with `0 still queued`. Don't retry this.
                 trace!("Sending keepalive");
-                self.last_keepalive_response = Some(std::time::Instant::now());
-                self.send_keepalive(true).await?;
+                self.send_keepalive().await?;
             }
             location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
                 info!(
@@ -2024,7 +2018,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                 self.state.saved_files.push(name.clone());
 
                 let info = InternalFileInfo {
-                    payload_id: file.payload_id(),
                     name: name.clone(),
                     saved_index: self.state.saved_files.len() - 1,
                     file_url: std::path::PathBuf::new(),
@@ -2507,12 +2500,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         Ok(())
     }
 
-    async fn send_keepalive(&mut self, ack: bool) -> Result<(), anyhow::Error> {
+    /// Answer a KeepAlive.
+    async fn send_keepalive(&mut self) -> Result<(), anyhow::Error> {
         let ack_frame = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
                 r#type: Some(location_nearby_connections::v1_frame::FrameType::KeepAlive.into()),
-                keep_alive: Some(KeepAliveFrame { ack: Some(ack) }),
+                keep_alive: Some(KeepAliveFrame { ack: Some(true) }),
                 ..Default::default()
             }),
         };

@@ -686,7 +686,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             |e| {
                 e.state = State::SentUkeyClientInit;
                 e.private_key = Some(secret_key);
-                e.public_key = Some(public_key);
                 e.client_init_msg_data = Some(frame.encode_to_vec());
                 e.ukey_client_finish_msg_data = Some(finish_frame.encode_to_vec());
             },
@@ -893,7 +892,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             }
             location_nearby_connections::v1_frame::FrameType::KeepAlive => {
                 trace!("Sending keepalive");
-                self.send_keepalive(true).await?;
+                self.send_keepalive().await?;
             }
             location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeRetry => {
                 info!(
@@ -1246,7 +1245,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     transferred_files.insert(
                         fmeta.payload_id(),
                         InternalFileInfo {
-                            payload_id: fmeta.payload_id(),
                             file_url: path.to_path_buf(),
                             bytes_transferred: 0,
                             total_size: fmeta.size(),
@@ -1531,7 +1529,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 
                             (
                                 InternalFileInfo {
-                                    payload_id: curr_state.payload_id,
                                     file_url: curr_state.file_url.clone(),
                                     bytes_transferred: curr_state.bytes_transferred,
                                     total_size: curr_state.total_size,
@@ -2278,12 +2275,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         Ok(())
     }
 
-    async fn send_keepalive(&mut self, ack: bool) -> Result<(), anyhow::Error> {
+    /// Answer a KeepAlive.
+    async fn send_keepalive(&mut self) -> Result<(), anyhow::Error> {
         let ack_frame = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
                 r#type: Some(location_nearby_connections::v1_frame::FrameType::KeepAlive.into()),
-                keep_alive: Some(KeepAliveFrame { ack: Some(ack) }),
+                keep_alive: Some(KeepAliveFrame { ack: Some(true) }),
                 ..Default::default()
             }),
         };
