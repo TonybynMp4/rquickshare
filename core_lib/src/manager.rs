@@ -48,12 +48,17 @@ pub struct TcpServer {
     /// transfer long, so without this a second request for the same peer would
     /// open a second connection to a device that is already receiving.
     outbound_inflight: Arc<Mutex<HashSet<String>>>,
+    /// Signalled whenever one of our connections ends and gives its socket
+    /// back. Out of handles, accept() waits on this rather than spinning or
+    /// sleeping: a connection closing is what frees one.
+    connection_closed: Arc<tokio::sync::Notify>,
 }
 
 /// Takes a send's id out of `outbound_inflight` when dropped.
 struct InflightGuard {
     set: Arc<Mutex<HashSet<String>>>,
     id: String,
+    closed: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for InflightGuard {
@@ -62,6 +67,62 @@ impl Drop for InflightGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        self.closed.notify_one();
+    }
+}
+
+/// Signals `TcpServer::connection_closed` when an inbound connection's task
+/// ends, however it ends.
+struct ClosedSignal(Arc<tokio::sync::Notify>);
+
+impl Drop for ClosedSignal {
+    fn drop(&mut self) {
+        // notify_one keeps a permit when nobody is waiting yet, so a
+        // connection that closes just before accept() starts waiting still
+        // wakes it.
+        self.0.notify_one();
+    }
+}
+
+/// What an accept() error means for the server.
+#[derive(Debug, PartialEq)]
+enum AcceptError {
+    /// About one incoming connection (reset or aborted before we took it, a
+    /// network blip). The listener is fine.
+    Connection,
+    /// Out of sockets or file handles. Retrying at once would fail again.
+    OutOfHandles,
+    /// The listener itself is unusable.
+    Fatal,
+}
+
+fn classify_accept_error(e: &std::io::Error) -> AcceptError {
+    // EMFILE / ENFILE / ENOBUFS, and WSAEMFILE / WSAENOBUFS on Windows.
+    #[cfg(target_os = "linux")]
+    const OUT_OF_HANDLES: &[i32] = &[24, 23, 105];
+    #[cfg(target_os = "macos")]
+    const OUT_OF_HANDLES: &[i32] = &[24, 23, 55];
+    #[cfg(target_os = "windows")]
+    const OUT_OF_HANDLES: &[i32] = &[10024, 10055];
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const OUT_OF_HANDLES: &[i32] = &[];
+
+    // EBADF / ENOTSOCK, and WSAENOTSOCK / WSAEINVAL on Windows.
+    #[cfg(target_os = "linux")]
+    const BROKEN_LISTENER: &[i32] = &[9, 88];
+    #[cfg(target_os = "macos")]
+    const BROKEN_LISTENER: &[i32] = &[9, 38];
+    #[cfg(target_os = "windows")]
+    const BROKEN_LISTENER: &[i32] = &[10038, 10022];
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const BROKEN_LISTENER: &[i32] = &[];
+
+    match e.raw_os_error() {
+        Some(code) if OUT_OF_HANDLES.contains(&code) => AcceptError::OutOfHandles,
+        Some(code) if BROKEN_LISTENER.contains(&code) => AcceptError::Fatal,
+        _ if e.kind() == std::io::ErrorKind::OutOfMemory => AcceptError::OutOfHandles,
+        _ if e.kind() == std::io::ErrorKind::InvalidInput => AcceptError::Fatal,
+        _ => AcceptError::Connection,
     }
 }
 
@@ -91,6 +152,7 @@ impl TcpServer {
             sender,
             connect_receiver,
             outbound_inflight: Arc::new(Mutex::new(HashSet::new())),
+            connection_closed: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -124,12 +186,13 @@ impl TcpServer {
                     let endpoint_id = self.endpoint_id;
                     let sender = self.sender.clone();
                     let inflight = self.outbound_inflight.clone();
+                    let closed = self.connection_closed.clone();
 
                     tokio::spawn(async move {
                         // Released however the task ends, a panic included;
                         // otherwise every later send to this device would be
                         // ignored as a duplicate until restart.
-                        let _inflight = InflightGuard { set: inflight, id: id.clone() };
+                        let _inflight = InflightGuard { set: inflight, id: id.clone(), closed };
 
                         if let Err(e) = Self::connect(endpoint_id, sender.clone(), cctk, i).await {
                             error!("{INNER_NAME}: error sending: {e}");
@@ -156,8 +219,10 @@ impl TcpServer {
                             trace!("{INNER_NAME}: new client: {remote_addr}");
                             let esender = self.sender.clone();
                             let csender = self.sender.clone();
+                            let closed = ClosedSignal(self.connection_closed.clone());
 
                             tokio::spawn(async move {
+                                let _closed = closed;
                                 let mut ir = InboundRequest::new(socket, remote_addr.to_string(), csender);
 
                                 loop {
@@ -212,10 +277,26 @@ impl TcpServer {
                                 }
                             });
                         },
-                        Err(err) => {
-                            error!("{INNER_NAME}: error accepting: {}", err);
-                            break;
-                        }
+                        // One bad accept used to stop the server, so nothing more
+                        // was received until a restart.
+                        Err(err) => match classify_accept_error(&err) {
+                            AcceptError::Connection => {
+                                debug!("{INNER_NAME}: dropped an incoming connection: {err}");
+                            }
+                            AcceptError::OutOfHandles => {
+                                warn!(
+                                    "{INNER_NAME}: out of sockets accepting ({err}); waiting for a connection to close"
+                                );
+                                tokio::select! {
+                                    _ = ctk.cancelled() => break,
+                                    _ = self.connection_closed.notified() => {}
+                                }
+                            }
+                            AcceptError::Fatal => {
+                                error!("{INNER_NAME}: the listener failed, no longer receiving: {err}");
+                                break;
+                            }
+                        },
                     }
                 }
             }
@@ -416,5 +497,38 @@ impl TcpServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reset_connection_does_not_stop_the_server() {
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert_eq!(classify_accept_error(&e), AcceptError::Connection);
+        let e = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(classify_accept_error(&e), AcceptError::Connection);
+    }
+
+    #[test]
+    fn running_out_of_handles_waits_instead_of_spinning() {
+        #[cfg(target_os = "windows")]
+        let code = 10024;
+        #[cfg(not(target_os = "windows"))]
+        let code = 24;
+        let e = std::io::Error::from_raw_os_error(code);
+        assert_eq!(classify_accept_error(&e), AcceptError::OutOfHandles);
+    }
+
+    #[test]
+    fn a_broken_listener_is_fatal() {
+        #[cfg(target_os = "windows")]
+        let code = 10038;
+        #[cfg(not(target_os = "windows"))]
+        let code = 9;
+        let e = std::io::Error::from_raw_os_error(code);
+        assert_eq!(classify_accept_error(&e), AcceptError::Fatal);
     }
 }
