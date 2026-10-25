@@ -2,4 +2,8 @@ target/
 *.snap
 gen
 node_modules
-.claude/
+# Claude Code: share the project settings and hooks, keep personal files
+# (settings.local.json, worktrees, ...) out.
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
