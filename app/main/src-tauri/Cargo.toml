@@ -3,8 +3,8 @@ name = "rquickshare"
 version.workspace = true
 default-run = "rquickshare"
 edition = "2021"
-authors = ["martichou"]
-repository = "https://github.com/Martichou/rquickshare"
+authors = ["martichou", "asulwer"]
+repository = "https://github.com/asulwer/rquickshare"
 license = "AGPL-3.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
