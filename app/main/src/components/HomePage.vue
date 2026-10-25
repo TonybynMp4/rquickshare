@@ -215,7 +215,7 @@ import { EndpointInfo } from '@martichou/core_lib/bindings/EndpointInfo';
 import { OutboundPayload } from '@martichou/core_lib/bindings/OutboundPayload';
 import { Visibility } from '@martichou/core_lib/bindings/Visibility';
 
-import { ToastNotification, ToDelete, stateToDisplay, autostartKey, DisplayedItem, useToastStore, opt, ToastType, utils } from '../vue_lib';
+import { ToastNotification, stateToDisplay, autostartKey, DisplayedItem, useToastStore, opt, ToastType, utils } from '../vue_lib';
 
 import SettingsModal from '../composables/SettingsModal.vue';
 import Heading from '../composables/Heading.vue';
@@ -258,13 +258,11 @@ export default {
 
 	data() {
 		return {
-			isAppInForeground: false,
 			discoveryRunning: ref(false),
 			isDragHovering: ref(false),
 
 			requests: ref<ChannelMessage[]>([]),
 			endpointsInfo: ref<EndpointInfo[]>([]),
-			toDelete: ref<ToDelete[]>([]),
 			outboundPayload: ref<OutboundPayload | undefined>(),
 			// SVG QR code returned by start_discovery. Scanning it makes a
 			// phone advertise itself to us even when it isn't set to
@@ -282,11 +280,8 @@ export default {
 			// Endpoint ids we've asked the backend to send to and not yet heard
 			// back about. Same purpose as `responding`, for the outbound side.
 			sending: ref<Set<string>>(new Set()),
-			// eslint-disable-next-line no-undef
-			sendWatchdogs: new Map<string, NodeJS.Timeout>(),
+			sendWatchdogs: new Map<string, number>(),
 
-			// eslint-disable-next-line no-undef
-			cleanupInterval: opt<NodeJS.Timeout>(),
 			unlisten: Array<UnlistenFn>(),
 
 			version: opt<string>(),
@@ -341,10 +336,8 @@ export default {
 			}
 
 			// Check permission for notification
-			let permissionGranted = await isPermissionGranted();
-			if (!permissionGranted) {
-				const permission = await requestPermission();
-				permissionGranted = permission === 'granted';
+			if (!(await isPermissionGranted())) {
+				await requestPermission();
 			}
 
 			this.unlisten.push(
@@ -364,13 +357,6 @@ export default {
 					// blank the card out mid-connect.
 					if (cm.state && this.stateToDisplay.includes(cm.state)) {
 						this.clearSendWatchdog(cm.id);
-					}
-
-					if (cm.state === "Disconnected") {
-						this.toDelete.push({
-							id: cm.id,
-							triggered: new Date().getTime()
-						});
 					}
 
 					// TODO - Automatically open || copy to clipboard + toast
@@ -456,7 +442,7 @@ export default {
 					return;
 				}
 
-				let text: string | null = null;
+				let text: string;
 				try {
 					text = await readText();
 				} catch {
@@ -478,7 +464,7 @@ export default {
 				if (!this.clipboardAutosync) return;
 				if (this.outboundPayload !== undefined) return;
 
-				let text: string | null = null;
+				let text: string;
 				try {
 					text = await readText();
 				} catch {
@@ -500,10 +486,6 @@ export default {
 
 	unmounted: function() {
 		this.unlisten.forEach((el) => el());
-
-		if (this.cleanupInterval && this.cleanupInterval[Symbol.dispose]) {
-			this.cleanupInterval[Symbol.dispose]();
-		}
 	},
 
 	computed: {
@@ -560,7 +542,7 @@ export default {
 		clearSendWatchdog: function(id: string) {
 			const timer = this.sendWatchdogs.get(id);
 			if (timer !== undefined) {
-				window.clearTimeout(timer as unknown as number);
+				window.clearTimeout(timer);
 				this.sendWatchdogs.delete(id);
 			}
 			this.sending.delete(id);
@@ -578,7 +560,7 @@ export default {
 			// hang. Rather than stranding the card on a spinner with no way back,
 			// give up after two minutes - comfortably longer than the slowest
 			// BLE connect we've measured.
-			this.sendWatchdogs.set(id, setTimeout(() => {
+			this.sendWatchdogs.set(id, window.setTimeout(() => {
 				if (!this.sending.has(id)) return;
 				this.clearSendWatchdog(id);
 				this.toastStore.addToast("No answer from that device - try again", ToastType.Error);

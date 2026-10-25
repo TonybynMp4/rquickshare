@@ -308,7 +308,7 @@ fn accept_peer(
 
     let paired = if pairing.IsPaired().unwrap_or(false) {
         info!("WiFi Direct: {name:?} already paired; unpairing to clear stale state");
-        let result = pairing.UnpairAsync()?.get()?;
+        let result = pairing.UnpairAsync()?.join()?;
         let status = result.Status()?;
         // NB: unpairing reports through `DeviceUnpairingResultStatus`, a
         // different enum from the `DevicePairingResultStatus` used for pairing.
@@ -318,7 +318,7 @@ fn accept_peer(
             // Let the driver settle, then re-read: the pairing handle we hold is
             // stale now.
             std::thread::sleep(std::time::Duration::from_secs(3));
-            let refreshed = DeviceInformation::CreateFromIdAsync(id)?.get()?;
+            let refreshed = DeviceInformation::CreateFromIdAsync(id)?.join()?;
             request_pair(&refreshed.Pairing()?)?
         } else {
             info!("WiFi Direct: unpair of {name:?} returned {status:?}; assuming still paired");
@@ -332,7 +332,7 @@ fn accept_peer(
         return Err(anyhow::anyhow!("pairing with {name:?} failed"));
     }
 
-    let device = WiFiDirectDevice::FromIdAsync(id)?.get()?;
+    let device = WiFiDirectDevice::FromIdAsync(id)?.join()?;
     let endpoint_pairs = device.GetConnectionEndpointPairs()?;
     if endpoint_pairs.Size()? > 0 {
         let pair = endpoint_pairs.GetAt(0)?;
@@ -386,7 +386,7 @@ fn request_pair(pairing: &DeviceInformationPairing) -> Result<bool, anyhow::Erro
             DevicePairingProtectionLevel::Default,
             &params,
         )?
-        .get()?;
+        .join()?;
     let status = result.Status()?;
     if status == DevicePairingResultStatus::Paired
         || status == DevicePairingResultStatus::AlreadyPaired
@@ -415,7 +415,7 @@ fn wait_for_gateway_ip() -> Option<String> {
 }
 
 fn gateway_ip() -> Option<String> {
-    for iface in get_if_addrs::get_if_addrs().ok()? {
+    for iface in if_addrs::get_if_addrs().ok()? {
         if let std::net::IpAddr::V4(v4) = iface.ip() {
             let o = v4.octets();
             if o[0] == 192 && o[1] == 168 && o[2] == 137 {

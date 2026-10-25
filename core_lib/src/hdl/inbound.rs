@@ -41,7 +41,7 @@ use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::{FromSec1Point, ToSec1Point};
 use p256::{PublicKey, Sec1Point};
 use prost::Message;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256, Sha512};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast::{Receiver, Sender};
@@ -821,7 +821,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             }
         })();
 
-        let if_addrs = get_if_addrs::get_if_addrs().ok()?;
+        let if_addrs = if_addrs::get_if_addrs().ok()?;
 
         let mut candidates: Vec<(i32, std::net::Ipv4Addr, String)> = Vec::new();
 

@@ -36,9 +36,9 @@ const INNER_NAME: &str = "BleDiscovery";
 /// scan on a fresh adapter doesn't reliably repopulate `peripherals()` anyway.
 /// Every attempt failed with "no longer advertising" for exactly that reason.
 /// Hold the handle discovery already has instead.
-static DISCOVERED: once_cell::sync::Lazy<
+static DISCOVERED: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, btleplug::platform::Peripheral>>,
-> = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Every address a given device name has been seen at this session.
 ///
@@ -48,8 +48,8 @@ static DISCOVERED: once_cell::sync::Lazy<
 /// an older entry failed with "Not connected": that address no longer exists.
 /// The device *name* is the stable identity, so remember which addresses belong
 /// to it and repoint all of them at the newest peripheral.
-static NAME_ADDRESSES: once_cell::sync::Lazy<std::sync::Mutex<HashMap<String, Vec<String>>>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+static NAME_ADDRESSES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Record a peripheral under `name`, and repoint every address previously seen
 /// for that name at it, so a stale entry in the UI still connects.
@@ -200,13 +200,12 @@ async fn read_peer_advertisement(
 /// when it is available: it is orders of magnitude faster than BLE's ~20 KB/s,
 /// so a BLE entry for a peer we can already reach over the network is never the
 /// one to pick.
-static LAN_NAMES: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashSet<String>>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static LAN_NAMES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// Where to publish endpoint changes, so a peer that turns up on the LAN can
 /// retract its own BLE listing. Set while `BleDiscovery` is running.
-static BLE_SENDER: once_cell::sync::Lazy<std::sync::Mutex<Option<Sender<EndpointInfo>>>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+static BLE_SENDER: std::sync::Mutex<Option<Sender<EndpointInfo>>> = std::sync::Mutex::new(None);
 
 /// Record a peer found over mDNS, and retract any BLE entry for the same device.
 ///
@@ -281,8 +280,8 @@ fn known_on_lan(name: &str) -> bool {
 /// handshake failures. A `watch` rather than a Notify because discovery must not
 /// miss the change - once scanning stops there are no BLE events to wake it, so
 /// a lost wakeup would suppress scanning permanently.
-static TRANSFER_COUNT: once_cell::sync::Lazy<tokio::sync::watch::Sender<usize>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::watch::channel(0usize).0);
+static TRANSFER_COUNT: std::sync::LazyLock<tokio::sync::watch::Sender<usize>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0usize).0);
 
 /// Pauses BLE discovery for as long as it is held.
 ///
@@ -307,8 +306,8 @@ impl Default for DiscoveryPause {
 
 /// Outbound BLE transfers only - see `AdvertisePause`. A `watch` so the Linux
 /// advertiser can wait on it rather than poll.
-static BLE_SEND_COUNT: once_cell::sync::Lazy<tokio::sync::watch::Sender<usize>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::watch::channel(0usize).0);
+static BLE_SEND_COUNT: std::sync::LazyLock<tokio::sync::watch::Sender<usize>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0usize).0);
 
 /// Pauses the BLE *receiver advertisement* while we are sending over BLE.
 ///

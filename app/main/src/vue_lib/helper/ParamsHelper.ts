@@ -1,16 +1,16 @@
-import { Store } from '@tauri-apps/plugin-store';
-import { UnlistenFn } from '@tauri-apps/api/event';
+import type { Store } from '@tauri-apps/plugin-store';
+import type { InvokeArgs } from '@tauri-apps/api/core';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 
-import { ToDelete } from '../types';
+import type { DisplayedItem } from '../types';
 
-import { EndpointInfo } from '@martichou/core_lib/bindings/EndpointInfo';
-import { Visibility } from '@martichou/core_lib/bindings/Visibility';
-import { OutboundPayload } from '@martichou/core_lib/bindings/OutboundPayload';
-import { ChannelMessage } from '@martichou/core_lib/bindings/ChannelMessage';
+import type { EndpointInfo } from '@martichou/core_lib/bindings/EndpointInfo';
+import type { Visibility } from '@martichou/core_lib/bindings/Visibility';
+import type { OutboundPayload } from '@martichou/core_lib/bindings/OutboundPayload';
+import type { ChannelMessage } from '@martichou/core_lib/bindings/ChannelMessage';
 
 export interface TauriVM {
 	store: Store;
-    isAppInForeground: boolean;
     discoveryRunning: boolean;
     qrSvg: string | undefined;
     qrAutoSent: boolean;
@@ -18,7 +18,6 @@ export interface TauriVM {
     isDragHovering: boolean;
     requests: ChannelMessage[];
     endpointsInfo: EndpointInfo[];
-    toDelete: ToDelete[];
     outboundPayload: OutboundPayload | undefined;
     unlisten: Array<UnlistenFn>;
     version: string | null;

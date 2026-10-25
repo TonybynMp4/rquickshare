@@ -60,10 +60,8 @@ async fn main() -> Result<(), anyhow::Error> {
             open_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
-        // `shell`'s `open` validates against a default allowlist of mailto:,
-        // tel: and http(s):// - so a filesystem path is rejected as "not a
-        // valid URI". `opener` is v2's replacement and handles paths properly.
+        // Opens URLs and received files. Tauri v2's replacement for the
+        // shell plugin's `open`, which rejects filesystem paths.
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             cmds::change_download_path,

@@ -105,9 +105,9 @@ impl WindowsHotspot {
                     Err(e) => warn!("hotspot: 5 GHz support query failed ({e}); using default"),
                 }
 
-                manager.ConfigureAccessPointAsync(&config)?.get()?;
+                manager.ConfigureAccessPointAsync(&config)?.join()?;
 
-                manager.StartTetheringAsync()?.get()?;
+                manager.StartTetheringAsync()?.join()?;
 
                 let gateway =
                     hotspot_gateway_ip().unwrap_or_else(|| "192.168.137.1".to_string());
@@ -128,7 +128,7 @@ impl WindowsHotspot {
                     // Park until the handle is dropped. A recv error means the
                     // sender went away, which is the same signal.
                     let _ = stop_rx.recv();
-                    match manager.StopTetheringAsync().and_then(|op| op.get()) {
+                    match manager.StopTetheringAsync().and_then(|op| op.join()) {
                         Ok(_) => info!("WindowsHotspot: tethering stopped"),
                         Err(e) => warn!("WindowsHotspot: failed to stop tethering: {e}"),
                     }
@@ -170,7 +170,7 @@ impl Drop for WindowsHotspot {
 /// The Windows tethering adapter lives on the 192.168.137.0/24 subnet; its local
 /// IPv4 is the gateway the peer connects to.
 fn hotspot_gateway_ip() -> Option<String> {
-    for iface in get_if_addrs::get_if_addrs().ok()? {
+    for iface in if_addrs::get_if_addrs().ok()? {
         if let IpAddr::V4(v4) = iface.ip() {
             let o = v4.octets();
             if o[0] == 192 && o[1] == 168 && o[2] == 137 {

@@ -3,11 +3,6 @@ import { DeviceType } from '@martichou/core_lib/bindings/DeviceType';
 import { TransferType } from '@martichou/core_lib/bindings/TransferType';
 import { Visibility } from '@martichou/core_lib/bindings/Visibility';
 
-export interface ToDelete {
-	id: string,
-	triggered: number
-}
-
 export interface DisplayedItem {
 	id: string,
 	name: string,

@@ -60,8 +60,7 @@ const pluralize = (n: number, s: string) => n === 1 ? s : `${s}s`;
 				<svg
 					xmlns="http://www.w3.org/2000/svg" fill="currentColor" height="24" viewBox="0 -960 960 960"
 					width="24" class="w-8 h-8">
-					<!-- eslint-disable-next-line -->
-                    <path d="M240-80q-33 0-56.5-23.5T160-160v-640q0-33 23.5-56.5T240-880h320l240 240v480q0 33-23.5 56.5T720-80H240Zm280-520v-200H240v640h480v-440H520ZM240-800v200-200 640-640Z" />
+					<path d="M240-80q-33 0-56.5-23.5T160-160v-640q0-33 23.5-56.5T240-880h320l240 240v480q0 33-23.5 56.5T720-80H240Zm280-520v-200H240v640h480v-440H520ZM240-800v200-200 640-640Z" />
 				</svg>
 			</div>
 			<template v-if="'Text' in props.vm.outboundPayload">

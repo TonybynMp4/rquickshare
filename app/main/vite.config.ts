@@ -1,6 +1,5 @@
+import tailwindcss from '@tailwindcss/vite'
 import vue from '@vitejs/plugin-vue'
-import { resolve } from 'path'
-import AutoImport from 'unplugin-auto-import/vite'
 import { defineConfig } from 'vitest/config'
 import path from 'path'
 
@@ -8,34 +7,28 @@ import path from 'path'
 export default defineConfig({
 	plugins: [
 		vue(),
-		// See https://github.com/unplugin/unplugin-auto-import
-		AutoImport({
-			imports: ['vue'],
-			dts: './src/auto-imports.d.ts',
-			eslintrc: {
-				enabled: true,
-				filepath: resolve(__dirname, '.eslintrc-auto-import.json'),
-			},
-		}),
+		tailwindcss(),
 	],
 	clearScreen: false,
-	envPrefix: ['VITE_', 'TAURI_'],
+	// Tauri v2 exposes its build variables as TAURI_ENV_*.
+	envPrefix: ['VITE_', 'TAURI_ENV_'],
 	server: {
 		port: 1420,
 		strictPort: true,
 		fs: {
 			allow: [
 				// Optionally, include other directories
-				path.resolve(__dirname)
+				path.resolve(import.meta.dirname)
 			]
 		}
 	},
 	build: {
 		outDir: './dist',
-		// See https://tauri.app/v1/references/webview-versions for details
-		target: process.env.TAURI_PLATFORM == 'windows' ? 'chrome105' : 'safari15',
-		minify: !process.env.TAURI_DEBUG ? 'esbuild' : false,
-		sourcemap: !!process.env.TAURI_DEBUG,
+		// WebView2 on Windows is Chromium; WebKitGTK on Linux and WKWebView on
+		// macOS are WebKit. See https://v2.tauri.app/reference/webview-versions/
+		target: process.env.TAURI_ENV_PLATFORM == 'windows' ? 'chrome105' : 'safari15',
+		minify: !process.env.TAURI_ENV_DEBUG,
+		sourcemap: !!process.env.TAURI_ENV_DEBUG,
 		emptyOutDir: true,
 	},
 	// See https://vitest.dev/config/

@@ -42,7 +42,7 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
         }
 
         let result = (|| -> Result<(), anyhow::Error> {
-            let adapters = WiFiAdapter::FindAllAdaptersAsync()?.get()?;
+            let adapters = WiFiAdapter::FindAllAdaptersAsync()?.join()?;
             if adapters.Size()? == 0 {
                 return Err(anyhow::anyhow!("no WiFi adapter"));
             }
@@ -54,7 +54,7 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
             // A just-created WiFi-Direct group owner does not appear in the
             // first scan - measured: "network DIRECT-52-... was not found", a
             // single scan giving up too early and dropping the transfer back to
-            // BLE. `ScanAsync().get()` already blocks until results are in, so
+            // BLE. `ScanAsync().join()` already blocks until results are in, so
             // the scan is the driver; what used to be a flat 2s sleep between
             // attempts is now a wait on AvailableNetworksChanged. If Windows
             // notices the AP on its own background scan during that gap we react
@@ -84,7 +84,7 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
             // different strategy.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             let found = loop {
-                adapter.ScanAsync()?.get()?;
+                adapter.ScanAsync()?.join()?;
                 if let Some(n) = find(&adapter)? {
                     break Some(n);
                 }
@@ -114,7 +114,7 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
                     WiFiReconnectionKind::Manual,
                     &credential,
                 )?
-                .get()?;
+                .join()?;
 
             match outcome.ConnectionStatus()? {
                 WiFiConnectionStatus::Success => Ok(()),
@@ -141,7 +141,7 @@ pub async fn wifi_disconnect() {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
-        if let Ok(adapters) = WiFiAdapter::FindAllAdaptersAsync().and_then(|op| op.get()) {
+        if let Ok(adapters) = WiFiAdapter::FindAllAdaptersAsync().and_then(|op| op.join()) {
             for i in 0..adapters.Size().unwrap_or(0) {
                 if let Ok(adapter) = adapters.GetAt(i) {
                     adapter.Disconnect().ok();
@@ -164,7 +164,7 @@ pub async fn wait_for_route(gateway: std::net::Ipv4Addr, timeout: std::time::Dur
     let want = gateway.octets();
 
     loop {
-        let on_subnet = get_if_addrs::get_if_addrs()
+        let on_subnet = if_addrs::get_if_addrs()
             .ok()
             .into_iter()
             .flatten()

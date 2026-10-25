@@ -17,7 +17,7 @@ use btleplug::api::{Characteristic, Peripheral as _, WriteType};
 use btleplug::platform::Peripheral;
 use futures::stream::StreamExt;
 use rand::distr::Alphanumeric;
-use rand::Rng;
+use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::{uuid, Uuid};
 

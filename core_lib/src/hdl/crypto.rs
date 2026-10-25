@@ -9,7 +9,7 @@
 //! One place for the cipher so all four call sites - inbound/outbound encrypt
 //! and decrypt - stay identical.
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 
 type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -22,7 +22,7 @@ pub fn aes256_cbc_decrypt(
 ) -> Result<Vec<u8>, anyhow::Error> {
     Aes256CbcDec::new_from_slices(&key[..32], iv)
         .map_err(|e| anyhow::anyhow!("aes256-cbc init (decrypt): {e}"))?
-        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .decrypt_padded_vec::<Pkcs7>(ciphertext)
         .map_err(|e| anyhow::anyhow!("aes256-cbc decrypt: {e}"))
 }
 
@@ -34,5 +34,5 @@ pub fn aes256_cbc_encrypt(
 ) -> Result<Vec<u8>, anyhow::Error> {
     Ok(Aes256CbcEnc::new_from_slices(&key[..32], iv)
         .map_err(|e| anyhow::anyhow!("aes256-cbc init (encrypt): {e}"))?
-        .encrypt_padded_vec_mut::<Pkcs7>(plaintext))
+        .encrypt_padded_vec::<Pkcs7>(plaintext))
 }

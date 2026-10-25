@@ -1,16 +1,16 @@
-import { devtools } from '@vue/devtools'
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 
-import './vue_lib/assets/main.postcss'
+import './vue_lib/assets/main.css'
 
 import App from './App.vue'
 
 // Only dial the standalone Vue devtools when it was actually started. `pnpm dev`
 // launches it and sets this flag; `pnpm tauri dev` does not, and without the
 // guard socket.io retries forever and floods the console with connection errors.
-if (process.env.NODE_ENV === 'development' && import.meta.env.VITE_VUE_DEVTOOLS === '1') {
-	devtools.connect('http://localhost', 8098)
+// Imported here rather than at the top so release builds don't bundle it.
+if (import.meta.env.DEV && import.meta.env.VITE_VUE_DEVTOOLS === '1') {
+	import('@vue/devtools').then(({ devtools }) => devtools.connect('http://localhost', 8098))
 }
 
 const pinia = createPinia();

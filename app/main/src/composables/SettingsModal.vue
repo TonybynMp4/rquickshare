@@ -108,12 +108,12 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown));
 
 <template>
 	<div
-		v-if="vm.settingsOpen" class="absolute z-10 w-full h-full flex justify-center items-center bg-black bg-opacity-25"
+		v-if="vm.settingsOpen" class="absolute z-10 w-full h-full flex justify-center items-center bg-black/25"
 		@click.self="close()">
 		<div
 			ref="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"
 			tabindex="-1"
-			class="bg-white dark:bg-neutral-800 rounded-xl shadow-xl p-4 w-[26rem] max-h-[calc(100%-2rem)] overflow-y-auto focus:outline-none">
+			class="bg-white dark:bg-neutral-800 rounded-xl shadow-xl p-4 w-[26rem] max-h-[calc(100%-2rem)] overflow-y-auto focus:outline-hidden">
 			<div class="flex flex-row justify-between items-center">
 				<h3 id="settings-title" class="font-medium text-xl">
 					Settings

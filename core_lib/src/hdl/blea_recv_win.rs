@@ -21,9 +21,10 @@ use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattReadRequestedEventArgs, GattServiceProvider, GattServiceProviderAdvertisingParameters,
     GattWriteOption, GattWriteRequestedEventArgs,
 };
-use windows::Foundation::{AsyncOperationCompletedHandler, TypedEventHandler};
+use windows::Foundation::TypedEventHandler;
 use windows::Storage::Streams::{DataReader, DataWriter};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows_future::AsyncOperationCompletedHandler;
 
 use super::ble_receiver;
 
@@ -703,7 +704,7 @@ impl BleReceiverAdvertiser {
 
             // Create the GATT service provider for 0xFEF3.
             let create_result =
-                GattServiceProvider::CreateAsync(COPRESENCE_SERVICE_GUID)?.get()?;
+                GattServiceProvider::CreateAsync(COPRESENCE_SERVICE_GUID)?.join()?;
             let error = create_result.Error()?;
             if error.0 != 0 {
                 return Err(anyhow::anyhow!(
@@ -722,7 +723,7 @@ impl BleReceiverAdvertiser {
             let char_result = provider
                 .Service()?
                 .CreateCharacteristicAsync(ADV_SLOT0_CHARACTERISTIC_GUID, &char_params)?
-                .get()?;
+                .join()?;
             let characteristic = char_result.Characteristic()?;
 
             let adv_for_read = full_advertisement.clone();
@@ -736,7 +737,7 @@ impl BleReceiverAdvertiser {
                 // Must take a deferral: fetching the request is async and WinRT
                 // will otherwise consider the event handled with no response.
                 let deferral = args.GetDeferral()?;
-                let request = args.GetRequestAsync()?.get()?;
+                let request = args.GetRequestAsync()?.join()?;
                 let writer = DataWriter::new()?;
                 writer.WriteBytes(&adv_for_read)?;
                 request.RespondWithValue(&writer.DetachBuffer()?)?;
@@ -784,7 +785,7 @@ impl BleReceiverAdvertiser {
             let stx_result = provider
                 .Service()?
                 .CreateCharacteristicAsync(BLE_SOCKET_SERVER_TX_GUID, &stx_params)?
-                .get()?;
+                .join()?;
             let server_tx = stx_result.Characteristic()?;
 
             // Log subscribe/unsubscribe so a stalled transfer can be told apart
@@ -824,7 +825,7 @@ impl BleReceiverAdvertiser {
             let ctx_result = provider
                 .Service()?
                 .CreateCharacteristicAsync(BLE_SOCKET_CLIENT_TX_GUID, &ctx_params)?
-                .get()?;
+                .join()?;
             let client_tx = ctx_result.Characteristic()?;
 
             // Reassembly state for multi-packet Weave messages.
@@ -873,7 +874,7 @@ impl BleReceiverAdvertiser {
                 };
                 let t_enter = std::time::Instant::now();
                 let deferral = args.GetDeferral()?;
-                let request = args.GetRequestAsync()?.get()?;
+                let request = args.GetRequestAsync()?.join()?;
                 let reader = DataReader::FromBuffer(&request.Value()?)?;
                 let len = reader.UnconsumedBufferLength()? as usize;
                 let mut buf = vec![0u8; len];
@@ -1086,7 +1087,7 @@ impl BleReceiverAdvertiser {
                          {packet_size} B, {subscribers} subscriber(s)) ***"
                     );
                     // Retries on non-Success delivery - see notify_confirm. Do
-                    // NOT block on .get() here: this runs on a WinRT write-event
+                    // NOT block on .join() here: this runs on a WinRT write-event
                     // handler thread, where waiting on the async op is illegal
                     // (0x8000000E) and can deadlock. The retry is driven entirely
                     // by the delivery-completion callback.
