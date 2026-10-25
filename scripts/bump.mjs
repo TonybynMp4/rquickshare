@@ -1,7 +1,16 @@
 #!/usr/bin/env node
-// Bumps [workspace.package] version in the root Cargo.toml (the single source
+// Sets [workspace.package] version in the root Cargo.toml (the single source
 // of truth both crates inherit via `version.workspace = true`) and refreshes
-// Cargo.lock to match. Does not commit or tag - release-please owns that.
+// Cargo.lock to match. Does not commit or tag.
+//
+//   pnpm bump major        1.0.0 -> 2.0.0, the only part changed by hand.
+//   node scripts/bump.mjs 1.26.298+42
+//                          What release.yml runs to stamp a release's version
+//                          (1.26.298.42) into its checkout. Cargo only takes
+//                          three numbers, so the build number goes after a +.
+//
+// Releases never commit their version, so Cargo.toml keeps <major>.0.0 and
+// local builds report that.
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -10,25 +19,19 @@ import path from 'node:path';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const cargoTomlPath = path.join(repoRoot, 'Cargo.toml');
 
-const SEMVER_RE = /^(\d+)\.(\d+)\.(\d+)$/;
+// x.y.z with an optional numeric +build. No leading zeros, as semver (and so
+// Cargo) requires.
+const VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+(0|[1-9]\d*))?$/;
 
-function parseSemver(version) {
-	const match = SEMVER_RE.exec(version);
+function parseVersion(version) {
+	const match = VERSION_RE.exec(version);
 	if (!match) return null;
-	return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
-}
-
-function compareSemver(a, b) {
-	if (a.major !== b.major) return a.major - b.major;
-	if (a.minor !== b.minor) return a.minor - b.minor;
-	return a.patch - b.patch;
-}
-
-function nextVersion(current, kind) {
-	if (kind === 'major') return { major: current.major + 1, minor: 0, patch: 0 };
-	if (kind === 'minor') return { major: current.major, minor: current.minor + 1, patch: 0 };
-	if (kind === 'patch') return { major: current.major, minor: current.minor, patch: current.patch + 1 };
-	return null;
+	return {
+		major: Number(match[1]),
+		minor: Number(match[2]),
+		patch: Number(match[3]),
+		build: match[4] === undefined ? null : Number(match[4]),
+	};
 }
 
 function fail(message) {
@@ -37,16 +40,16 @@ function fail(message) {
 }
 
 const arg = process.argv[2];
-if (!arg) fail('missing argument, expected "major", "minor", "patch", or an explicit x.y.z version');
+if (!arg) fail('missing argument, expected "major" or an explicit x.y.z[+build] version');
 
 const toml = readFileSync(cargoTomlPath, 'utf8');
 
 // Scope the search to the [workspace.package] table so a same-named key in
-// another table can't be matched by accident.
-const sectionHeader = '[workspace.package]';
-const sectionStart = toml.indexOf(`${sectionHeader}\n`);
-if (sectionStart === -1) fail('could not find [workspace.package] section in Cargo.toml');
-const bodyStart = sectionStart + sectionHeader.length + 1;
+// another table can't be matched by accident. Either line ending, as a
+// Windows checkout may have CRLF.
+const sectionMatch = /^\[workspace\.package\]\r?\n/m.exec(toml);
+if (!sectionMatch) fail('could not find [workspace.package] section in Cargo.toml');
+const bodyStart = sectionMatch.index + sectionMatch[0].length;
 const nextHeaderMatch = /^\[/m.exec(toml.slice(bodyStart));
 const bodyEnd = nextHeaderMatch ? bodyStart + nextHeaderMatch.index : toml.length;
 const sectionBody = toml.slice(bodyStart, bodyEnd);
@@ -57,21 +60,19 @@ if (versionMatches.length === 0) fail('no version key found in [workspace.packag
 if (versionMatches.length > 1) fail(`expected exactly one version key in [workspace.package], found ${versionMatches.length}`);
 
 const currentVersionStr = versionLineRe.exec(sectionBody)[1];
-const currentVersion = parseSemver(currentVersionStr);
-if (!currentVersion) fail(`current version "${currentVersionStr}" in Cargo.toml is not a valid x.y.z semver`);
+const currentVersion = parseVersion(currentVersionStr);
+if (!currentVersion) fail(`current version "${currentVersionStr}" in Cargo.toml is not a valid x.y.z[+build] version`);
 
 let newVersion;
-if (arg === 'major' || arg === 'minor' || arg === 'patch') {
-	newVersion = nextVersion(currentVersion, arg);
+if (arg === 'major') {
+	newVersion = { major: currentVersion.major + 1, minor: 0, patch: 0, build: null };
 } else {
-	newVersion = parseSemver(arg);
-	if (!newVersion) fail(`"${arg}" is not "major", "minor", "patch", or a valid x.y.z version`);
-	if (compareSemver(newVersion, currentVersion) <= 0) {
-		fail(`"${arg}" must be greater than the current version "${currentVersionStr}"`);
-	}
+	newVersion = parseVersion(arg);
+	if (!newVersion) fail(`"${arg}" is not "major" or a valid x.y.z[+build] version`);
 }
 
-const newVersionStr = `${newVersion.major}.${newVersion.minor}.${newVersion.patch}`;
+const newVersionStr = `${newVersion.major}.${newVersion.minor}.${newVersion.patch}`
+	+ (newVersion.build === null ? '' : `+${newVersion.build}`);
 
 const updatedBody = sectionBody.replace(versionLineRe, `version = "${newVersionStr}"`);
 const updatedToml = toml.slice(0, bodyStart) + updatedBody + toml.slice(bodyEnd);

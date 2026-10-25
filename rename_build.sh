@@ -29,20 +29,24 @@ for file in $files; do
     filename=$(basename "$file")
     extension="${filename##*.}"
 
-    # Extract the version and anything part
-    if [[ "$filename" =~ ([Rr]-?[Qq]uick[Ss]hare)_?([0-9]+\.[0-9]+\.[0-9]+)_(.*)\.${extension} ]]; then
-        version="v${BASH_REMATCH[2]}"
-        anything="${BASH_REMATCH[3]}"
-    elif [[ "$filename" =~ ([Rr]-?[Qq]uick[Ss]hare)-([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)\.(.*)\.${extension} ]]; then
-        version="v${BASH_REMATCH[2]}"
-        anything="${BASH_REMATCH[3]}-${BASH_REMATCH[4]}"
-    elif [[ "$filename" =~ ([rR]([-_][qQ]uick[-_][sS]hare))_?([0-9]+\.[0-9]+\.[0-9]+)_?(.*)\.${extension} ]]; then
-        version="v${BASH_REMATCH[3]}"
+    # Extract the version and anything part. A release's version carries its
+    # build number after a + (1.26.298+42), as Cargo only takes three numbers;
+    # the file name gets the four-number form, 1.26.298.42.
+    ver_re='([0-9]+\.[0-9]+\.[0-9]+(\+[0-9]+)?)'
+    if [[ "$filename" =~ ([Rr]-?[Qq]uick[Ss]hare)_?${ver_re}_(.*)\.${extension} ]]; then
+        version="${BASH_REMATCH[2]}"
         anything="${BASH_REMATCH[4]}"
+    elif [[ "$filename" =~ ([Rr]-?[Qq]uick[Ss]hare)-${ver_re}-([0-9]+)\.(.*)\.${extension} ]]; then
+        version="${BASH_REMATCH[2]}"
+        anything="${BASH_REMATCH[4]}-${BASH_REMATCH[5]}"
+    elif [[ "$filename" =~ ([rR]([-_][qQ]uick[-_][sS]hare))_?${ver_re}_?(.*)\.${extension} ]]; then
+        version="${BASH_REMATCH[3]}"
+        anything="${BASH_REMATCH[5]}"
     else
         echo "Filename does not match the expected pattern: $filename"
         continue
     fi
+    version="v${version/+/.}"
 
     # Construct the new filename based on the presence of glibc and debug_mode
     if [ -n "$glib_ver" ]; then

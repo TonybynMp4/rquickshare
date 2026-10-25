@@ -16,12 +16,14 @@
 
 Send and receive files, text and links between an Android phone and your computer, using the same Quick Share your phone already has.
 
-This is a fork of [Martichou/rquickshare](https://github.com/Martichou/rquickshare) that adds Windows support and transfers that work without a shared Wi-Fi network (see [How devices connect](#how-devices-connect)).
+It adds Windows support and transfers that work without a shared Wi-Fi network (see [How devices connect](#how-devices-connect)). It started as a fork of [Martichou/rquickshare](https://github.com/Martichou/rquickshare) by Martin André and is now developed separately; see [Credits](#credits).
 
 Installation
 --------------------------
 
 Download the installer for your system from the [latest release](https://github.com/asulwer/rquickshare/releases/latest). To build it yourself instead, see [BUILD.md](BUILD.md).
+
+Versions look like `1.26.298.42`: the major version, the year and the day of the year the release was built (26.298 is October 25, 2026), then a build number that goes up with every release.
 
 The installers aren't code-signed yet, so Windows and macOS will warn you the first time - see below.
 
@@ -64,29 +66,6 @@ sudo dnf install ./r-quick-share-main_v*.rpm
 ```bash
 sudo rpm -i r-quick-share-main_v*.rpm
 ```
-
----
-
-<details>
-<summary>Packages of the original project</summary>
-
-These install [Martichou/rquickshare](https://github.com/Martichou/rquickshare), not this fork, so they don't include the Windows and Bluetooth work.
-
-#### AUR (Arch)
-
-```bash
-yay -S r-quick-share
-```
-
-#### Nix
-
-Available here: [NixOS](https://search.nixos.org/packages?show=rquickshare&query=rquickshare)
-
-```bash
-nix-shell -p rquickshare
-```
-
-</details>
 
 ---
 
@@ -201,7 +180,7 @@ Credits
 
 This project wouldn't exist without these amazing open-source projects:
 
-- https://github.com/Martichou/rquickshare (the original project this fork builds on)
+- https://github.com/Martichou/rquickshare by Martin André, the original project this one grew out of
 - https://github.com/grishka/NearDrop
 - https://github.com/vicr123/QNearbyShare
 

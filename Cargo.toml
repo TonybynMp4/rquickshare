@@ -5,8 +5,12 @@ resolver = "2"
 # Single source of truth for the version. Both crates inherit it via
 # `version.workspace = true`, and tauri.conf.json reads it from
 # app/main/src-tauri/Cargo.toml.
+#
+# Only the major number is set here, by hand (`pnpm bump major`). A release
+# stamps <major>.<YY>.<DDD>+<build> into its own checkout and is published as
+# <major>.<YY>.<DDD>.<build>; see .github/workflows/release.yml.
 [workspace.package]
-version = "0.13.1"
+version = "1.0.0"
 
 # Profiles must live at the workspace root (per-crate profiles are ignored).
 [profile.release]

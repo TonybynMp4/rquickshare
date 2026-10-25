@@ -1,5 +1,7 @@
 # Changelog
 
+From version 1 on, each release's notes are on its [GitHub release](https://github.com/asulwer/rquickshare/releases). This file keeps the history up to 0.13.1. Entries from 0.11.5 and earlier come from [Martichou/rquickshare](https://github.com/Martichou/rquickshare), the project this one started from.
+
 ## [0.13.1](https://github.com/asulwer/rquickshare/compare/v0.13.0...v0.13.1) (2026-10-04)
 
 

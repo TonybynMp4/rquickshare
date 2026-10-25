@@ -2,7 +2,8 @@
 name = "rqs_lib"
 version.workspace = true
 edition = "2021"
-authors = ["martichou"]
+authors = ["martichou", "asulwer"]
+repository = "https://github.com/asulwer/rquickshare"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [[bin]]
