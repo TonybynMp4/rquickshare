@@ -1272,7 +1272,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                         size: Some(fmetadata.len() as i64),
                         mime_type: Some(ftype),
                         r#type: Some(meta_type.into()),
-                        ..Default::default()
                     };
                     transferred_files.insert(
                         fmeta.payload_id(),

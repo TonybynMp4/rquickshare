@@ -1,6 +1,6 @@
-# rquickshare fork — TODO / roadmap
+# rquickshare — TODO / roadmap
 
-Tracks work on this fork: transport mediums, completed features, and parked
+Tracks work on rquickshare: transport mediums, completed features, and parked
 items. Check items off (`[x]`) as they land; for parked items, note why.
 
 ## Known issues
@@ -533,7 +533,7 @@ best available one. Goal: support them all.
 - [ ] **WebRTC** — Quick Share uses it via signaling infrastructure; likely
       needs Google-side signaling. Feasibility unclear.
 
-## Completed (this fork)
+## Completed (since the split from Martichou/rquickshare)
 
 - [x] Windows build support (was Linux/macOS only) — issue #295.
 - [x] #268 — mDNS discovery busy-spin log flood fix.
@@ -1174,9 +1174,6 @@ best available one. Goal: support them all.
   Google's own clients. It's an access-control boundary by design (identity
   verification is the whole point of contacts mode), not a hard problem to grind
   through. QR sharing solves the real underlying need instead.
-- Upstream candidates to PR to Martichou/rquickshare: Windows support, the log
-  fixes, send-text. **Caveat: Martichou appears inactive**, so these may have
-  nowhere to land — see the mdns-sd note below.
 - **mdns-sd: migrated off the fork (2026-07-16).** We were pinned to
   `Martichou/mdns-sd` **branch** `unsolicited`, which is a snapshot of upstream
   **0.10.4 (Feb 2024)**. Now on the published `mdns-sd = "0.20"` from

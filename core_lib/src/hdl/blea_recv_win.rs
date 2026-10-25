@@ -30,13 +30,13 @@ use super::ble_receiver;
 const INNER_NAME: &str = "BleReceiverAdvertiser";
 
 // Copresence service 0000FEF3-0000-1000-8000-00805F9B34FB.
-const COPRESENCE_SERVICE_GUID: GUID = GUID::from_u128(0x0000_FEF3_0000_1000_8000_00805F9B34FB);
+const COPRESENCE_SERVICE_GUID: GUID = GUID::from_u128(0x0000_FEF3_0000_1000_8000_0080_5F9B_34FB);
 
 // Per-slot advertisement characteristic 00000000-0000-3000-8000-000000000000
 // (slot 0). A peer that finds our advertisement connects and reads this to get
 // the full BleAdvertisement - the `isPrivateGatt` / `rxAdvertisement` flow.
 const ADV_SLOT0_CHARACTERISTIC_GUID: GUID =
-    GUID::from_u128(0x0000_0000_0000_3000_8000_000000000000);
+    GUID::from_u128(0x0000_0000_0000_3000_8000_0000_0000_0000);
 
 // Nearby's BLE socket ("MultiplexBleSocketImpl"). After reading our
 // advertisement the phone connects and looks for these; without the client-tx
@@ -46,8 +46,8 @@ const ADV_SLOT0_CHARACTERISTIC_GUID: GUID =
 //   server tx = us -> phone   (we notify)
 // Only ...0101 is confirmed from logcat; ...0102 is the obvious counterpart in
 // the same scheme. The phone names whatever is still missing, so iterate on it.
-const BLE_SOCKET_CLIENT_TX_GUID: GUID = GUID::from_u128(0x0000_0100_0004_1000_8000_001a11000101);
-const BLE_SOCKET_SERVER_TX_GUID: GUID = GUID::from_u128(0x0000_0100_0004_1000_8000_001a11000102);
+const BLE_SOCKET_CLIENT_TX_GUID: GUID = GUID::from_u128(0x0000_0100_0004_1000_8000_001a_1100_0101);
+const BLE_SOCKET_SERVER_TX_GUID: GUID = GUID::from_u128(0x0000_0100_0004_1000_8000_001a_1100_0102);
 
 /// Send a Weave ConnectionConfirm notification, retrying on non-Success delivery.
 ///
@@ -419,7 +419,7 @@ impl BleReceiverAdvertiser {
                                         // few percent, the gap between packets is the
                                         // link (connection interval) and no amount of
                                         // optimising our code will help.
-                                        let mean_us = if calls > 0 { us / calls } else { 0 };
+                                        let mean_us = us.checked_div(calls).unwrap_or(0);
                                         let busy = us as f64 / elapsed.as_micros() as f64 * 100.0;
                                         info!(
                                             "{INNER_NAME}: BLE rx {:.1} KB/s ({rx_frames} frames, \

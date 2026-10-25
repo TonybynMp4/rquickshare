@@ -870,7 +870,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             candidates.push((score, v4, iface.name));
         }
 
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
 
         if let Some((score, ip, ref name)) = candidates.first() {
             info!(
