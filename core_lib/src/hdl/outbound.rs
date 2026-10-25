@@ -1521,8 +1521,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                                 break;
                             }
 
-                            let mut buffer = vec![0u8; self.chunk_size];
+                            // Read no further than the size the peer was told:
+                            // a file that grew since then is sent as it was
+                            // announced. One that shrank would otherwise read 0
+                            // bytes forever and never reach `total_size`.
+                            let remaining = curr_state.total_size - curr_state.bytes_transferred;
+                            let want = remaining.min(self.chunk_size as i64) as usize;
+                            let mut buffer = vec![0u8; want];
                             let bytes_read = curr_state.file.as_ref().unwrap().read(&mut buffer)?;
+                            if bytes_read == 0 {
+                                return Err(anyhow!(
+                                    "{:?} shrank while sending: {} of {} bytes read",
+                                    curr_state.file_url,
+                                    curr_state.bytes_transferred,
+                                    curr_state.total_size
+                                ));
+                            }
 
                             (
                                 InternalFileInfo {
