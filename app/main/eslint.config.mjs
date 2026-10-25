@@ -17,17 +17,17 @@ export default [
 	{files: ["**/*.{js,mjs,cjs,ts,vue}"]},
 	{files: ["**/*.js"], languageOptions: {sourceType: "commonjs"}},
 	{languageOptions: { globals: globals.browser }},
+	// Build and tool configs run in Node, not the webview.
+	{files: ["*.config.{js,mjs,cjs,ts}"], languageOptions: { globals: globals.node }},
 	pluginJs.configs.recommended,
 	...tseslint.configs.recommended,
 	...pluginVue.configs["flat/essential"],
 	...pluginVue.configs["flat/strongly-recommended"],
-	{files: ["**/*.vue"], languageOptions: {parserOptions: {parser: '@typescript-eslint/parser'}}},
+	{files: ["**/*.vue"], languageOptions: {parserOptions: {parser: tseslint.parser}}},
 	{
 		rules: {
 			'vue/no-multiple-template-root': "off",
-			// eslint-disable-next-line no-undef
 			'no-console': process.env.NODE_ENV === 'production' ? 'warn' : 'off',
-			// eslint-disable-next-line no-undef
 			'no-debugger': process.env.NODE_ENV === 'production' ? 'warn' : 'off',
 			'vue/max-attributes-per-line': ['error', {
 				singleline: {

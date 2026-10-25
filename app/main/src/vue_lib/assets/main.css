@@ -1,18 +1,33 @@
 @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@100;300;400;500;600;700;800;900&display=swap');
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-@layer utilities {
-    /* Chrome, Safari and Opera */
-    .no-scrollbar::-webkit-scrollbar {
-        display: none;
-    }
-    .no-scrollbar {
-        -ms-overflow-style: none;
-        /* IE and Edge */
-        scrollbar-width: none;
-        /* Firefox */
-    }
+@import 'tailwindcss';
+
+/* Tailwind 4 changed a few preflight defaults; these keep the v3 look. */
+@layer base {
+	/* v4 borders default to currentColor; v3 used gray-200. */
+	*,
+	::after,
+	::before,
+	::backdrop,
+	::file-selector-button {
+		border-color: var(--color-gray-200, currentColor);
+	}
+
+	/* v4 gives buttons the default cursor; v3 used a pointer. */
+	button:not(:disabled),
+	[role='button']:not(:disabled) {
+		cursor: pointer;
+	}
+}
+
+@utility no-scrollbar {
+	/* Chrome, Safari and Opera */
+	&::-webkit-scrollbar {
+		display: none;
+	}
+	/* IE and Edge */
+	-ms-overflow-style: none;
+	/* Firefox */
+	scrollbar-width: none;
 }
 
 html,
@@ -106,11 +121,11 @@ body,
 }
 
 .status-indicator--success .circle-secondary {
-	@apply bg-black bg-opacity-10
+	@apply bg-black/10
 }
 
 .status-indicator--success .circle-tertiary {
-	@apply bg-black bg-opacity-40
+	@apply bg-black/40
 }
 
 @keyframes pulsate-tertiary {
@@ -164,8 +179,8 @@ body,
    moves nothing reads as a click that didn't land. */
 .btn {
 	@apply h-12 min-h-12 cursor-pointer select-none rounded-xl font-medium px-4 inline-flex justify-center items-center gap-2
-		transition duration-150 ease-in-out hover:bg-gray-500 hover:bg-opacity-10
-		active:scale-95 active:bg-gray-500 active:bg-opacity-20
+		transition duration-150 ease-in-out hover:bg-gray-500/10
+		active:scale-95 active:bg-gray-500/20
 }
 
 /* For clickable surfaces too big to shrink by 5% without looking like a glitch -
@@ -181,12 +196,12 @@ body,
 
 .settings-row {
 	@apply flex flex-row justify-between items-center gap-3 rounded-xl p-3
-		hover:bg-gray-500 hover:bg-opacity-10
+		hover:bg-gray-500/10
 }
 
 .settings-field {
-	@apply rounded-xl bg-white dark:bg-neutral-700 border border-gray-500 border-opacity-30 px-2 py-1 text-sm
-		focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500
+	@apply rounded-xl bg-white dark:bg-neutral-700 border border-gray-500/30 px-2 py-1 text-sm
+		focus:outline-hidden focus-visible:ring-2 focus-visible:ring-green-500
 }
 
 /* WebKitGTK draws a native <select> with the GTK theme (bigger, its own
@@ -206,7 +221,7 @@ select.settings-field {
 .switch {
 	@apply shrink-0 h-5 w-9 rounded-full cursor-pointer bg-neutral-300 dark:bg-neutral-600
 		transition-all duration-150 ease-in-out
-		focus:outline-none focus-visible:ring-2 focus-visible:ring-green-500 focus-visible:ring-offset-2
+		focus:outline-hidden focus-visible:ring-2 focus-visible:ring-green-500 focus-visible:ring-offset-2
 		dark:focus-visible:ring-offset-neutral-800;
 	appearance: none;
 	background-image: radial-gradient(circle, #fff 0 0.5rem, transparent calc(0.5rem + 1px));
@@ -252,7 +267,7 @@ select.settings-field {
 }
 
 .error circle.bg, .error circle.fg {
-    @apply !stroke-red-400
+    @apply stroke-red-400!
 }
 
 /* Automatic dark theme: follows the OS via prefers-color-scheme (no toggle). */

@@ -68,7 +68,9 @@ pub struct WindowsWifiDirect {
     publisher: WiFiDirectAdvertisementPublisher,
     /// Held so the listener outlives `start()`. Dropping it stops Windows
     /// answering P2P association attempts.
-    _listener: WiFiDirectConnectionListener,
+    listener: WiFiDirectConnectionListener,
+    /// The `ConnectionRequested` registration, removed again in `stop()`.
+    connection_requested: i64,
     /// Accepted peers. A `WiFiDirectDevice` *is* the connection - drop it and
     /// Windows tears the association down, so they have to live as long as the
     /// group does.
@@ -169,27 +171,28 @@ impl WindowsWifiDirect {
         let peers: Arc<Mutex<Vec<WiFiDirectDevice>>> = Arc::new(Mutex::new(Vec::new()));
         let listener = WiFiDirectConnectionListener::new()?;
         let peers_for_handler = Arc::clone(&peers);
-        listener.ConnectionRequested(&TypedEventHandler::<
-            WiFiDirectConnectionListener,
-            WiFiDirectConnectionRequestedEventArgs,
-        >::new(move |_sender, args| {
-            let Some(args) = args.as_ref() else {
-                return Ok(());
-            };
-            let request = args.GetConnectionRequest()?;
-            let device_info = request.DeviceInformation()?;
-            let name = device_info
-                .Name()
-                .map(|n| n.to_string())
-                .unwrap_or_default();
-            let id = device_info.Id()?;
-            info!("*** WiFi Direct: ConnectionRequested from {name:?} ***");
+        let connection_requested =
+            listener.ConnectionRequested(&TypedEventHandler::<
+                WiFiDirectConnectionListener,
+                WiFiDirectConnectionRequestedEventArgs,
+            >::new(move |_sender, args| {
+                let Some(args) = args.as_ref() else {
+                    return Ok(());
+                };
+                let request = args.GetConnectionRequest()?;
+                let device_info = request.DeviceInformation()?;
+                let name = device_info
+                    .Name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                let id = device_info.Id()?;
+                info!("*** WiFi Direct: ConnectionRequested from {name:?} ***");
 
-            if let Err(e) = accept_peer(&device_info, &id, &name, &peers_for_handler) {
-                warn!("WiFi Direct: failed to accept {name:?}: {e}");
-            }
-            Ok(())
-        }))?;
+                if let Err(e) = accept_peer(&device_info, &id, &name, &peers_for_handler) {
+                    warn!("WiFi Direct: failed to accept {name:?}: {e}");
+                }
+                Ok(())
+            }))?;
 
         publisher.Start()?;
 
@@ -247,7 +250,8 @@ impl WindowsWifiDirect {
         Ok((
             Self {
                 publisher,
-                _listener: listener,
+                listener,
+                connection_requested,
                 peers,
             },
             WifiDirectCreds {
@@ -260,6 +264,13 @@ impl WindowsWifiDirect {
     }
 
     fn stop(&self) -> Result<(), anyhow::Error> {
+        // No new peers once we're stopping.
+        if let Err(e) = self
+            .listener
+            .RemoveConnectionRequested(self.connection_requested)
+        {
+            warn!("WiFi Direct: failed to remove the connection handler: {e}");
+        }
         // Drop the accepted peers first: each WiFiDirectDevice is a live
         // association, and they should go before the advertisement that carries
         // them rather than be torn down by process exit.
@@ -308,7 +319,7 @@ fn accept_peer(
 
     let paired = if pairing.IsPaired().unwrap_or(false) {
         info!("WiFi Direct: {name:?} already paired; unpairing to clear stale state");
-        let result = pairing.UnpairAsync()?.get()?;
+        let result = pairing.UnpairAsync()?.join()?;
         let status = result.Status()?;
         // NB: unpairing reports through `DeviceUnpairingResultStatus`, a
         // different enum from the `DevicePairingResultStatus` used for pairing.
@@ -318,7 +329,7 @@ fn accept_peer(
             // Let the driver settle, then re-read: the pairing handle we hold is
             // stale now.
             std::thread::sleep(std::time::Duration::from_secs(3));
-            let refreshed = DeviceInformation::CreateFromIdAsync(id)?.get()?;
+            let refreshed = DeviceInformation::CreateFromIdAsync(id)?.join()?;
             request_pair(&refreshed.Pairing()?)?
         } else {
             info!("WiFi Direct: unpair of {name:?} returned {status:?}; assuming still paired");
@@ -332,7 +343,7 @@ fn accept_peer(
         return Err(anyhow::anyhow!("pairing with {name:?} failed"));
     }
 
-    let device = WiFiDirectDevice::FromIdAsync(id)?.get()?;
+    let device = WiFiDirectDevice::FromIdAsync(id)?.join()?;
     let endpoint_pairs = device.GetConnectionEndpointPairs()?;
     if endpoint_pairs.Size()? > 0 {
         let pair = endpoint_pairs.GetAt(0)?;
@@ -386,7 +397,7 @@ fn request_pair(pairing: &DeviceInformationPairing) -> Result<bool, anyhow::Erro
             DevicePairingProtectionLevel::Default,
             &params,
         )?
-        .get()?;
+        .join()?;
     let status = result.Status()?;
     if status == DevicePairingResultStatus::Paired
         || status == DevicePairingResultStatus::AlreadyPaired
@@ -415,7 +426,7 @@ fn wait_for_gateway_ip() -> Option<String> {
 }
 
 fn gateway_ip() -> Option<String> {
-    for iface in get_if_addrs::get_if_addrs().ok()? {
+    for iface in if_addrs::get_if_addrs().ok()? {
         if let std::net::IpAddr::V4(v4) = iface.ip() {
             let o = v4.octets();
             if o[0] == 192 && o[1] == 168 && o[2] == 137 {

@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(all(target_os = "windows", feature = "experimental"))]
 fn print_interfaces() {
-    match get_if_addrs::get_if_addrs() {
+    match if_addrs::get_if_addrs() {
         Ok(ifaces) => {
             for iface in ifaces {
                 println!("  {} -> {}", iface.name, iface.ip());

@@ -37,7 +37,7 @@ pub async fn negotiated_att_mtu(address: u64) -> Option<u16> {
     tokio::task::spawn_blocking(move || {
         let device = BluetoothLEDevice::FromBluetoothAddressAsync(address)
             .ok()?
-            .get()
+            .join()
             .ok()?;
         let id = device.BluetoothDeviceId().ok()?;
 
@@ -48,7 +48,7 @@ pub async fn negotiated_att_mtu(address: u64) -> Option<u16> {
         // Left to drop rather than closed explicitly: `Close` comes from
         // IClosable and needs the trait in scope, and with MaintainConnection
         // false there is nothing held open to release.
-        let session = GattSession::FromDeviceIdAsync(&id).ok()?.get().ok()?;
+        let session = GattSession::FromDeviceIdAsync(&id).ok()?.join().ok()?;
         session.MaxPduSize().ok()
     })
     .await

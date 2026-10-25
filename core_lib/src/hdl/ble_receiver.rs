@@ -26,6 +26,12 @@
 
 use sha2::{Digest, Sha256};
 
+/// Largest Weave message we reassemble: the biggest frame the stack accepts
+/// (5 MiB) plus the 3-byte service hash and 4-byte length in front of it. The
+/// GATT server takes writes from any nearby device without pairing, so a peer
+/// that never sets the "last" bit must not be able to grow a buffer forever.
+pub(crate) const MAX_WEAVE_MESSAGE: usize = 5 * 1024 * 1024 + 7;
+
 fn sha256_prefix(data: &[u8], n: usize) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(data);

@@ -83,7 +83,7 @@ impl BleListener {
 
             let le = tokio::task::spawn_blocking(|| {
                 BluetoothAdapter::GetDefaultAsync()?
-                    .get()?
+                    .join()?
                     .IsLowEnergySupported()
             })
             .await?;
@@ -654,10 +654,11 @@ async fn bluetooth_turned_on() {
     use windows::core::IInspectable;
     use windows::Devices::Bluetooth::BluetoothAdapter;
     use windows::Devices::Radios::{Radio, RadioState};
-    use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
+    use windows::Foundation::TypedEventHandler;
 
-    // Unregisters the handler however the wait ends.
-    struct Subscription(Radio, EventRegistrationToken);
+    // Unregisters the handler however the wait ends. windows 0.62 hands back
+    // the registration token as a plain i64.
+    struct Subscription(Radio, i64);
     impl Drop for Subscription {
         fn drop(&mut self) {
             let _ = self.0.RemoveStateChanged(self.1);
@@ -666,9 +667,9 @@ async fn bluetooth_turned_on() {
 
     let radio = tokio::task::spawn_blocking(|| {
         BluetoothAdapter::GetDefaultAsync()?
-            .get()?
+            .join()?
             .GetRadioAsync()?
-            .get()
+            .join()
     })
     .await;
     if let Ok(Ok(radio)) = radio {

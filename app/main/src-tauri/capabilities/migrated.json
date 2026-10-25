@@ -26,7 +26,6 @@
     "dialog:allow-open",
     "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text",
-    "shell:allow-open",
     "opener:allow-open-url",
     "opener:allow-default-urls",
     {

@@ -3,7 +3,7 @@ import { TauriVM } from './helper/ParamsHelper';
 import { autostartKey, clipboardAutosyncKey, debugLevelKey, DisplayedItem, downloadPathKey, nearbyAlertsKey, numberToVisibility, realcloseKey, startminimizedKey, stateToDisplay, visibilityKey, visibilityToNumber } from './types';
 import { SendInfo } from '@martichou/core_lib/bindings/SendInfo';
 import { ChannelMessage } from '@martichou/core_lib/bindings/ChannelMessage';
-import { ChannelAction } from '@martichou/core_lib';
+import { ChannelAction } from '@martichou/core_lib/bindings/ChannelAction';
 
 // Not `_`-prefixed: setup() exposes this on the component, and Vue reserves the
 // `_` and `$` prefixes for its internals (it warns and skips them).

@@ -60,10 +60,8 @@ async fn main() -> Result<(), anyhow::Error> {
             open_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
-        // `shell`'s `open` validates against a default allowlist of mailto:,
-        // tel: and http(s):// - so a filesystem path is rejected as "not a
-        // valid URI". `opener` is v2's replacement and handles paths properly.
+        // Opens URLs and received files. Tauri v2's replacement for the
+        // shell plugin's `open`, which rejects filesystem paths.
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             cmds::change_download_path,
@@ -243,7 +241,10 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
                             .and_then(|meta| meta.source.as_ref())
                             .map(|source| source.name.clone())
                             .unwrap_or_else(|| "Unknown".to_string());
+                        #[cfg(target_os = "linux")]
                         send_request_notification(name, info.id.clone(), &capp_handle);
+                        #[cfg(not(target_os = "linux"))]
+                        send_request_notification(name, &capp_handle);
                     }
                     // The card in the window already offers Copy/Open, so only
                     // notify when the user isn't looking at it.

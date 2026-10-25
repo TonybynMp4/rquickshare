@@ -23,12 +23,14 @@ pub enum Visibility {
 }
 
 impl Visibility {
-    pub fn from_raw_value(value: u64) -> Self {
+    /// `None` for a value no version of the app ever stored, so a damaged
+    /// settings file falls back to a default instead of panicking at startup.
+    pub fn from_raw_value(value: u64) -> Option<Self> {
         match value {
-            0 => Visibility::Visible,
-            1 => Visibility::Invisible,
-            2 => Visibility::Temporarily,
-            _ => unreachable!(),
+            0 => Some(Visibility::Visible),
+            1 => Some(Visibility::Invisible),
+            2 => Some(Visibility::Temporarily),
+            _ => None,
         }
     }
 }

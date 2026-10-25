@@ -1,33 +1,14 @@
 {
 	"name": "@martichou/core_lib",
 	"version": "1.0.9",
-	"description": "Models being shared with the VueJS application",
-	"main": "dist/index.js",
-	"module": "esm/index.js",
-	"types": "dist/index.d.ts",
-	"files": [
-	  "dist",
-	  "bindings",
-	  "esm"
-	],
-	"scripts": {
-	  "build:cjs": "tsc --module commonjs --outDir dist",
-	  "build:esm": "tsc --target es2018 --outDir esm",
-	  "build": "npm run build:esm && npm run build:cjs"
-	},
+	"private": true,
+	"description": "TypeScript types generated from rqs_lib by ts-rs (bindings/), linked into the app",
 	"repository": {
-	  "type": "git",
-	  "url": "git+https://github.com/asulwer/rquickshare.git"
+		"type": "git",
+		"url": "git+https://github.com/asulwer/rquickshare.git"
 	},
 	"author": "Martin ANDRE",
 	"contributors": [
-	  "asulwer"
-	],
-	"bugs": {
-	  "url": "https://github.com/asulwer/rquickshare/issues"
-	},
-	"homepage": "https://github.com/asulwer/rquickshare#readme",
-	"devDependencies": {
-	  "typescript": "^5.0.4"
-	}
-  }
+		"asulwer"
+	]
+}

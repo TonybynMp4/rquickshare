@@ -5,12 +5,12 @@ use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use bytes::Bytes;
-use get_if_addrs::get_if_addrs;
 use hkdf::Hkdf;
+use if_addrs::get_if_addrs;
 use num_bigint::{BigUint, ToBigInt};
 use p256::elliptic_curve::Generate;
 use p256::{PublicKey, SecretKey};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -364,17 +364,13 @@ pub fn gen_random(size: usize) -> Vec<u8> {
 }
 
 pub fn get_download_dir() -> PathBuf {
-    let cdown = CUSTOM_DOWNLOAD.read();
-    match cdown {
-        Ok(mg) => {
-            if mg.is_some() {
-                return mg.as_ref().unwrap().to_path_buf();
-            }
-        }
-        Err(_) => {
-            // TODO
-        }
+    // A writer that panicked can't have left a half-written PathBuf behind, so
+    // a poisoned lock still holds a usable value.
+    let custom = CUSTOM_DOWNLOAD.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = custom.as_ref() {
+        return dir.clone();
     }
+    drop(custom);
 
     if let Some(user_dirs) = directories::UserDirs::new() {
         if let Some(dd) = user_dirs.download_dir() {
@@ -385,6 +381,76 @@ pub fn get_download_dir() -> PathBuf {
     }
 
     Path::new("/").to_path_buf()
+}
+
+/// Turns a file name sent by a peer into one that is safe to create inside the
+/// download directory.
+///
+/// The name comes straight off the wire. Pushed onto a `PathBuf` as-is, an
+/// absolute name replaces the download directory and `..` climbs out of it,
+/// so a nearby device could write anywhere the user can - a Startup-folder
+/// script on Windows, `~/.config/autostart` on Linux. Only the last path
+/// component survives here, with the characters and names Windows can't
+/// create (or would read as an alternate data stream or a device) replaced.
+/// The same rules apply on every OS so a transfer saves under the same name
+/// everywhere.
+pub fn sanitize_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+
+    let mut clean: String = last
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+
+    // Windows drops trailing dots and spaces, which would make "a.txt." and
+    // "a.txt" the same file.
+    let trimmed_len = clean.trim_end_matches(['.', ' ']).len();
+    clean.truncate(trimmed_len);
+
+    if clean.is_empty() {
+        return "file".to_owned();
+    }
+
+    let stem = clean.split('.').next().unwrap_or_default();
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+    ) || (stem.len() == 4
+        && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        clean.insert(0, '_');
+    }
+
+    clean
+}
+
+/// Creates `name` in `dir` without touching anything already there, prefixing
+/// `1_`, `2_`, ... until a free name is found. `create_new` makes the check
+/// and the creation one step, so a file that appears while the user is
+/// deciding, or a second file of the same name in this transfer, is never
+/// truncated.
+pub fn create_unique_file(dir: &Path, name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut candidate = dir.join(name);
+    let mut counter = 0u32;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                counter += 1;
+                candidate = dir.join(format!("{counter}_{name}"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 pub fn is_not_self_ip(ip_address: &IpAddr) -> bool {
@@ -715,5 +781,54 @@ mod tests {
     fn test_is_not_self_ip_for_documentation_address() {
         // TEST-NET-3: reserved for documentation, never on a real interface.
         assert!(is_not_self_ip(&"203.0.113.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn sanitize_file_name_keeps_only_the_last_component() {
+        assert_eq!(sanitize_file_name("photo.jpg"), "photo.jpg");
+        assert_eq!(
+            sanitize_file_name("../../.config/autostart/x.desktop"),
+            "x.desktop"
+        );
+        assert_eq!(
+            sanitize_file_name(r"..\..\AppData\Roaming\Microsoft\x.bat"),
+            "x.bat"
+        );
+        assert_eq!(sanitize_file_name(r"C:\Windows\evil.dll"), "evil.dll");
+        assert_eq!(sanitize_file_name("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name(".."), "file");
+        assert_eq!(sanitize_file_name(""), "file");
+        assert_eq!(sanitize_file_name("dir/"), "file");
+    }
+
+    #[test]
+    fn sanitize_file_name_replaces_what_windows_cannot_create() {
+        assert_eq!(sanitize_file_name("a:stream"), "a_stream");
+        assert_eq!(sanitize_file_name("what?.txt"), "what_.txt");
+        assert_eq!(sanitize_file_name("tab\there"), "tab_here");
+        assert_eq!(sanitize_file_name("trailing.txt. "), "trailing.txt");
+        assert_eq!(sanitize_file_name("CON"), "_CON");
+        assert_eq!(sanitize_file_name("nul.txt"), "_nul.txt");
+        assert_eq!(sanitize_file_name("COM1.log"), "_COM1.log");
+        assert_eq!(sanitize_file_name("COMPUTER.txt"), "COMPUTER.txt");
+        assert_eq!(sanitize_file_name("résumé.pdf"), "résumé.pdf");
+    }
+
+    #[test]
+    fn create_unique_file_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("rqs-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (first, _) = create_unique_file(&dir, "same.txt").unwrap();
+        std::fs::write(&first, b"keep me").unwrap();
+        let (second, _) = create_unique_file(&dir, "same.txt").unwrap();
+        let (third, _) = create_unique_file(&dir, "same.txt").unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "same.txt");
+        assert_eq!(second.file_name().unwrap(), "1_same.txt");
+        assert_eq!(third.file_name().unwrap(), "2_same.txt");
+        assert_eq!(std::fs::read(&first).unwrap(), b"keep me");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

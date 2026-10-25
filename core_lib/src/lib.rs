@@ -13,9 +13,8 @@ use channel::ChannelMessage;
 ))]
 use hdl::BleAdvertiser;
 use hdl::MDnsDiscovery;
-use once_cell::sync::Lazy;
 use rand::distr::Alphanumeric;
-use rand::Rng;
+use rand::RngExt;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -104,14 +103,13 @@ pub mod location_nearby_connections {
     include!(concat!(env!("OUT_DIR"), "/location.nearby.connections.rs"));
 }
 
-static CUSTOM_DOWNLOAD: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
+static CUSTOM_DOWNLOAD: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// User-chosen name to advertise instead of the machine hostname.
 ///
 /// `None` means "fall back to the hostname"; see [`utils::device_name`], which
 /// is the only thing that should read this.
-pub(crate) static CUSTOM_DEVICE_NAME: Lazy<RwLock<Option<String>>> =
-    Lazy::new(|| RwLock::new(None));
+pub(crate) static CUSTOM_DEVICE_NAME: RwLock<Option<String>> = RwLock::new(None);
 
 #[derive(Debug)]
 pub struct RQS {

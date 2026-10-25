@@ -1,4 +1,0 @@
-[target.aarch64-unknown-linux-gnu]
-pre-build = [
-    "apt update && apt install -y libprotobuf-dev protobuf-compiler",
-]
