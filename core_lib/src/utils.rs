@@ -380,7 +380,11 @@ pub fn get_download_dir() -> PathBuf {
         return user_dirs.home_dir().to_path_buf();
     }
 
-    Path::new("/").to_path_buf()
+    // No home directory at all (a service account, a broken profile). The temp
+    // directory is always writable by us; the drive root, which this used to
+    // be, usually isn't, and filling it with received files would be worse.
+    warn!("no download or home directory; saving received files to the temp directory");
+    std::env::temp_dir()
 }
 
 /// Turns a file name sent by a peer into one that is safe to create inside the

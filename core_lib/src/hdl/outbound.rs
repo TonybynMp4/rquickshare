@@ -970,11 +970,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     if send_wifi_upgrade_enabled() {
                         let lan = info.wifi_lan_socket.as_ref().and_then(|s| {
                             let ip = s.ip_address();
-                            (ip.len() == 4 && s.wifi_port.is_some()).then(|| {
-                                (
-                                    std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
-                                    s.wifi_port() as u16,
-                                )
+                            // A port that doesn't fit is a bad offer, not one
+                            // to wrap round to some other port.
+                            let port = u16::try_from(s.wifi_port?).ok()?;
+                            (ip.len() == 4).then(|| {
+                                (std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port)
                             })
                         });
                         if let Some((ip, port)) = lan {
@@ -1197,26 +1197,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         match &self.payload {
             OutboundPayload::Files(files) => {
                 for f in files {
+                    // A file that can't be sent fails the transfer. Skipping it
+                    // used to send the rest and report Finished, so the user
+                    // was told everything went when some of it never left.
                     let path = Path::new(f);
                     if !path.is_file() {
-                        warn!("Path is not a file: {}", f);
-                        continue;
+                        return Err(anyhow!("can't send {f}: it is not a file"));
                     }
 
-                    let file = match File::open(f) {
-                        Ok(_f) => _f,
-                        Err(e) => {
-                            error!("Failed to open file: {f}: {:?}", e);
-                            continue;
-                        }
-                    };
-                    let fmetadata = match file.metadata() {
-                        Ok(_fm) => _fm,
-                        Err(e) => {
-                            error!("Failed to get metadata for: {f}: {:?}", e);
-                            continue;
-                        }
-                    };
+                    let file = File::open(f).map_err(|e| anyhow!("can't open {f}: {e}"))?;
+                    let fmetadata = file
+                        .metadata()
+                        .map_err(|e| anyhow!("can't read the size of {f}: {e}"))?;
 
                     let ftype = mime_guess::from_path(path)
                         .first_or_octet_stream()
@@ -2007,10 +1999,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             warn!("Bandwidth upgrade: peer offered a hotspot with no credentials");
             return;
         };
+        let Ok(port) = u16::try_from(creds.port()) else {
+            warn!(
+                "Bandwidth upgrade: peer offered a hotspot on port {}",
+                creds.port()
+            );
+            return;
+        };
         self.join_started = true;
         self.joined_ap = true;
         let gateway = creds.gateway().to_string();
-        let port = creds.port() as u16;
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
         let ready = self.join_ready.clone();
 
