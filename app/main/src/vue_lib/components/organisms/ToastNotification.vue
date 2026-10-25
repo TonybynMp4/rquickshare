@@ -5,10 +5,6 @@ import ToastMessage from '../atoms/ToastMessage.vue';
 
 const store = useToastStore();
 const toasts = computed(() => store.toasts);
-
-function removeToast(id: number) {
-	store.removeToast(id);
-}
 </script>
 
 <template>
@@ -19,8 +15,7 @@ function removeToast(id: number) {
 			<ToastMessage
 				:id="toast.id"
 				:message="toast.message"
-				:type="toast.type"
-				@remove="removeToast" />
+				:type="toast.type" />
 		</div>
 	</div>
 </template>

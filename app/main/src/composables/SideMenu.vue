@@ -70,7 +70,7 @@ const pluralize = (n: number, s: string) => n === 1 ? s : `${s}s`;
 			</template>
 			<template v-else>
 				<p v-for="f in (props.vm.outboundPayload as any).Files" :key="f" class="overflow-hidden whitespace-nowrap text-ellipsis">
-					{{ f.split('/').pop() }}
+					{{ f.split(/[\\/]/).pop() }}
 				</p>
 			</template>
 
