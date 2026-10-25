@@ -352,7 +352,7 @@ impl BleReceiverAdvertiser {
                                                 send_pkt(confirm);
                                                 let _ = new_session_tx.send(());
                                             } else {
-                                                info!("{INNER_NAME}: weave control cmd={cmd} {:02x?}", &buf);
+                                                info!("{INNER_NAME}: weave control cmd={cmd} {buf:02x?}");
                                             }
                                         }
 

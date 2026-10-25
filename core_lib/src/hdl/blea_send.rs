@@ -92,9 +92,13 @@ const SANE_FRAME_LENGTH: usize = 5 * 1024 * 1024;
 pub struct BleChannel {
     /// Hand to `OutboundRequest`.
     pub stream: tokio::io::DuplexStream,
+    // The upgrade hooks. Only Windows can move a send onto WiFi (it joins the
+    // phone's hotspot), so elsewhere there is nothing to hand them to.
     /// Where the upgrade listener delivers the socket the peer connected on.
+    #[cfg(target_os = "windows")]
     pub upgrade_tx: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
     /// Signals that the old channel is released and the stream may move.
+    #[cfg(target_os = "windows")]
     pub switch_tx: tokio::sync::mpsc::UnboundedSender<()>,
     /// Fired once the upgraded socket is actually spliced in.
     ///
@@ -103,6 +107,7 @@ pub struct BleChannel {
     /// CLIENT_INTRODUCTION, so anything still going out over BLE in that window
     /// is written to a link nobody reads - yet counted as sent, leaving our
     /// offsets megabytes ahead of what the peer actually received.
+    #[cfg(target_os = "windows")]
     pub switched: std::sync::Arc<tokio::sync::Notify>,
 }
 
@@ -616,10 +621,18 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
         }
     });
 
+    // Without a taker for the upgrade hooks, close them now: the pump's
+    // upgrade and switch branches then end instead of waiting forever.
+    #[cfg(not(target_os = "windows"))]
+    drop((upgrade_tx, switch_tx, switched));
+
     Ok(BleChannel {
         stream: near,
+        #[cfg(target_os = "windows")]
         upgrade_tx,
+        #[cfg(target_os = "windows")]
         switch_tx,
+        #[cfg(target_os = "windows")]
         switched,
     })
 }
