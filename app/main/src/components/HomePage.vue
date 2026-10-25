@@ -205,8 +205,7 @@ import { getStore } from "@tauri-apps/plugin-store";
 import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
 import { disable, enable } from '@tauri-apps/plugin-autostart';
 import { open as tauriDialog } from '@tauri-apps/plugin-dialog';
-import { openUrl as openExternalUrl, openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
-import { join } from '@tauri-apps/api/path';
+import { openUrl as openExternalUrl } from '@tauri-apps/plugin-opener';
 import { writeText, readText } from '@tauri-apps/plugin-clipboard-manager';
 
 import { ChannelMessage } from '@martichou/core_lib/bindings/ChannelMessage';
@@ -607,46 +606,32 @@ export default {
 				console.error("Error opening URL", e);
 			}
 		},
-		// "Open" on a received transfer. `destination` is the download *folder*,
-		// so opening it alone only ever showed the folder. With a single file we
-		// can open the file itself, which is what the button implies; for a
-		// multi-file transfer there's no one file to open, so fall back to the
-		// folder. A shared URL payload is a web link and goes to openUrl.
+		// "Open" on a received transfer. A shared URL payload is a web link and
+		// goes to openUrl. Files go through the backend, which knows what this
+		// transfer saved: it opens a single file, shows several in their
+		// folder, and shows rather than runs anything executable, since the
+		// sender could be anyone nearby.
 		openTransfer: async function(item: DisplayedItem) {
 			if (item.text_type === 'Url' && item.text_payload) {
 				await this.openUrl(item.text_payload);
 				return;
 			}
 
-			if (!item.destination) return;
-
 			try {
-				const files = item.files ?? [];
-				const target = files.length === 1
-					? await join(item.destination, files[0])
-					: item.destination;
-				await openPath(target);
+				const outcome = await invoke<string>('open_received', { id: item.id });
+				if (outcome === 'revealed' && (item.files ?? []).length === 1) {
+					this.toastStore.addToast("This file could run code, so it's shown in its folder instead", ToastType.Info);
+				}
 			} catch (e) {
 				this.toastStore.addToast("Could not open the received file", ToastType.Error);
 				console.error("Error opening transfer", e);
 			}
 		},
-		// "Open folder" on a received transfer. Reveal the received files so the
-		// file manager selects them (`files` holds the saved names once
-		// finished); if that fails, open the folder.
+		// "Open folder" on a received transfer: its files, selected in the file
+		// manager.
 		openFolder: async function(item: DisplayedItem) {
-			const destination = item.destination;
-			if (!destination) return;
-
 			try {
-				try {
-					const paths = await Promise.all((item.files ?? []).map((f) => join(destination, f)));
-					await revealItemInDir(paths);
-					return;
-				} catch (e) {
-					console.warn("Could not reveal the received files, opening their folder", e);
-				}
-				await openPath(destination);
+				await invoke('reveal_received', { id: item.id });
 			} catch (e) {
 				this.toastStore.addToast("Could not open the download folder", ToastType.Error);
 				console.error("Error opening folder", e);

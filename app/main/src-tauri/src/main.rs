@@ -39,6 +39,9 @@ pub struct AppState {
     // Async mutex: `stop()` is awaited while held, which a std::sync::Mutex
     // cannot safely do (its guard isn't meant to live across an await point).
     pub rqs: AsyncMutex<RQS>,
+    /// Transfer id -> the files a finished inbound transfer saved, so "Open"
+    /// and "Open folder" act on those and never on a path from the webview.
+    pub received: std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 }
 
 #[tokio::main]
@@ -76,6 +79,8 @@ async fn main() -> Result<(), anyhow::Error> {
             cmds::change_device_name,
             cmds::send_payload,
             cmds::send_to_rs,
+            cmds::open_received,
+            cmds::reveal_received,
         ])
         .setup(|app| {
             // Setting up logging inside file for the app
@@ -122,6 +127,7 @@ async fn main() -> Result<(), anyhow::Error> {
                         sender_file,
                         ble_receiver,
                         rqs: AsyncMutex::new(rqs),
+                        received: Default::default(),
                     });
                 });
             });
@@ -221,6 +227,26 @@ fn fix_wayland_titlebar(window: &tauri::WebviewWindow) {
     }
 }
 
+/// Records where a finished inbound transfer's files landed, before the front
+/// end hears that it finished and can ask to open them.
+fn remember_received(info: &ChannelMessage, state: &AppState) {
+    let Some(meta) = info.meta.as_ref() else {
+        return;
+    };
+    let (Some(destination), Some(files)) = (meta.destination.as_ref(), meta.files.as_ref()) else {
+        return;
+    };
+    let paths = files
+        .iter()
+        .map(|name| std::path::Path::new(destination).join(name))
+        .collect();
+    state
+        .received
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(info.id.clone(), paths);
+}
+
 fn spawn_receiver_tasks(app_handle: &AppHandle) {
     let capp_handle = app_handle.clone();
     tauri::async_runtime::spawn(async move {
@@ -245,6 +271,11 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
                         send_request_notification(name, info.id.clone(), &capp_handle);
                         #[cfg(not(target_os = "linux"))]
                         send_request_notification(name, &capp_handle);
+                    }
+                    if info.rtype == Some(TransferType::Inbound)
+                        && info.state == Some(State::Finished)
+                    {
+                        remember_received(&info, &state);
                     }
                     // The card in the window already offers Copy/Open, so only
                     // notify when the user isn't looking at it.

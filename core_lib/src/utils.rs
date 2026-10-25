@@ -453,6 +453,20 @@ pub fn create_unique_file(dir: &Path, name: &str) -> std::io::Result<(PathBuf, s
     }
 }
 
+/// Tags a received file the way Windows tags a download: a `Zone.Identifier`
+/// stream with zone 3 (Internet). Without it a received `.exe` or script runs
+/// with no SmartScreen prompt and Office opens received documents outside
+/// Protected View, as if they were the user's own. Best effort: a volume
+/// without alternate data streams (FAT32, exFAT) just can't carry the tag.
+#[cfg(target_os = "windows")]
+pub fn mark_as_downloaded(path: &Path) {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    if let Err(e) = std::fs::write(&stream, "[ZoneTransfer]\r\nZoneId=3\r\n") {
+        warn!("Could not mark {path:?} as downloaded: {e}");
+    }
+}
+
 pub fn is_not_self_ip(ip_address: &IpAddr) -> bool {
     if let Ok(if_addrs) = get_if_addrs() {
         for if_addr in if_addrs {
@@ -828,6 +842,23 @@ mod tests {
         assert_eq!(second.file_name().unwrap(), "1_same.txt");
         assert_eq!(third.file_name().unwrap(), "2_same.txt");
         assert_eq!(std::fs::read(&first).unwrap(), b"keep me");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn mark_as_downloaded_writes_the_internet_zone() {
+        let dir = std::env::temp_dir().join(format!("rqs-motw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, _) = create_unique_file(&dir, "received.exe").unwrap();
+
+        mark_as_downloaded(&path);
+
+        let mut stream = path.as_os_str().to_owned();
+        stream.push(":Zone.Identifier");
+        let tag = std::fs::read_to_string(&stream).unwrap();
+        assert!(tag.contains("ZoneId=3"), "{tag:?}");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

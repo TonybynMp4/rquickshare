@@ -2200,6 +2200,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
 
             let (path, file) = create_unique_file(&dir, &mfi.name)?;
             info!("Created file: {path:?}");
+            #[cfg(target_os = "windows")]
+            crate::utils::mark_as_downloaded(&path);
             if let Some(saved) = path.file_name() {
                 self.state.saved_files[mfi.saved_index] = saved.to_string_lossy().into_owned();
             }
