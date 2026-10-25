@@ -20,7 +20,9 @@ log = "0.4.34"
 notify-rust = "4.18"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rqs_lib = { path = "../../../core_lib", features = ["experimental"] }
-tauri = { version = "2.12", features = [ "devtools", "tray-icon", "image-png"] }
+# No "devtools": debug builds always have the inspector, and release builds
+# shouldn't ship it.
+tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2.7"
 tauri-plugin-notification = "2.7"
 tauri-plugin-single-instance = "2.5"
