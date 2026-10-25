@@ -31,8 +31,8 @@ async fn run_handshake() -> (InboundRequest<DuplexStream>, OutboundRequest<Duple
 
     // Separate channels: in production these are separate processes, and a
     // shared one would let each side observe the other's UI traffic.
-    let (in_tx, _in_rx) = broadcast::channel(64);
-    let (out_tx, _out_rx) = broadcast::channel(64);
+    let in_tx = broadcast::channel(64).0;
+    let out_tx = broadcast::channel(64).0;
 
     let mut ir = InboundRequest::new(server, "inbound".to_owned(), in_tx);
     let mut or = OutboundRequest::new(
@@ -328,8 +328,8 @@ async fn loopback_text_send_ends_on_the_receivers_hang_up() {
     use crate::errors::AppError;
 
     let (client, server) = duplex(64 * 1024);
-    let (in_tx, _in_rx) = broadcast::channel(64);
-    let (out_tx, _out_rx) = broadcast::channel(64);
+    let in_tx = broadcast::channel(64).0;
+    let out_tx = broadcast::channel(64).0;
 
     let mut ir = InboundRequest::new(server, "inbound".to_owned(), in_tx.clone());
     let mut or = OutboundRequest::new(

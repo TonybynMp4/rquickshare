@@ -96,6 +96,56 @@ pub use outbound::*;
 #[cfg(test)]
 mod tests;
 
+/// Adds one chunk of a Bytes payload to its buffer and, once the chunk marked
+/// last arrives, takes the finished payload out and returns it.
+///
+/// Bytes payloads come from the peer before anyone has said who it is (UKEY2
+/// is anonymous), so every size here is the peer's claim. Nothing is reserved
+/// up front from `total_size`; a buffer never grows past the size it
+/// declared; and all buffers together never hold more than `max_total`, the
+/// largest frame we accept anyway. A finished payload's buffer is removed, so
+/// a peer can't keep memory pinned by never reusing an id.
+pub(crate) fn buffer_bytes_chunk(
+    buffers: &mut HashMap<i64, Vec<u8>>,
+    payload_id: i64,
+    total_size: i64,
+    chunk: &crate::location_nearby_connections::payload_transfer_frame::PayloadChunk,
+    max_total: usize,
+) -> Result<Option<Vec<u8>>, anyhow::Error> {
+    let declared = usize::try_from(total_size)
+        .ok()
+        .filter(|&n| n <= max_total)
+        .ok_or_else(|| {
+            buffers.remove(&payload_id);
+            anyhow::anyhow!("Bytes payload {payload_id} declares {total_size} bytes")
+        })?;
+
+    let body = chunk.body.as_deref().unwrap_or_default();
+    let buffered: usize = buffers.values().map(Vec::len).sum();
+    let buffer = buffers.entry(payload_id).or_default();
+
+    if chunk.offset() != buffer.len() as i64 {
+        let expected = buffer.len();
+        buffers.remove(&payload_id);
+        return Err(anyhow::anyhow!(
+            "Unexpected chunk offset: {}, expected: {expected}",
+            chunk.offset()
+        ));
+    }
+    if buffer.len() + body.len() > declared || buffered + body.len() > max_total {
+        buffers.remove(&payload_id);
+        return Err(anyhow::anyhow!(
+            "Bytes payload {payload_id} grew past its declared {declared} bytes"
+        ));
+    }
+    buffer.extend_from_slice(body);
+
+    if (chunk.flags() & 1) == 1 {
+        return Ok(buffers.remove(&payload_id));
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq)]
 #[ts(export)]
 pub enum State {

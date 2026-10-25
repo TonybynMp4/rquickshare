@@ -292,7 +292,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 server_seq: 0,
                 client_seq: 0,
                 state: State::Initial,
-                encryption_done: true,
+                encryption_done: false,
                 transfer_metadata: Some(TransferMetadata {
                     id: String::from(""),
                     source: Some(rdi),
@@ -405,7 +405,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             // Both branches are channel receives, so both are cancel-safe.
             frame = self.frames.recv() => {
                 match frame {
-                    Some(frame_data) => self._handle(frame_data).await?,
+                    Some(frame_data) => self.handle_frame(frame_data).await?,
                     None => return Err(anyhow!(std::io::Error::from(
                         std::io::ErrorKind::UnexpectedEof
                     ))),
@@ -455,13 +455,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 
         loop {
             match self.frames.try_recv() {
-                // Boxed to break a type-level cycle: this calls `_handle`,
+                // Boxed to break a type-level cycle: this calls `handle_frame`,
                 // which can reach `process_consent`, which contains the send
                 // loop that calls back here. At runtime the frames arriving
                 // mid-send are keepalives and acks rather than consent frames,
                 // so it does not actually re-enter - but the compiler cannot
                 // know that and needs the indirection to size the future.
-                Ok(frame_data) => Box::pin(self._handle(frame_data)).await?,
+                Ok(frame_data) => Box::pin(self.handle_frame(frame_data)).await?,
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     return Err(anyhow!(std::io::Error::from(
@@ -483,14 +483,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     async fn await_next_frame(&mut self) -> Result<(), anyhow::Error> {
         match self.frames.recv().await {
-            Some(frame_data) => Box::pin(self._handle(frame_data)).await,
+            Some(frame_data) => Box::pin(self.handle_frame(frame_data)).await,
             None => Err(anyhow!(std::io::Error::from(
                 std::io::ErrorKind::UnexpectedEof
             ))),
         }
     }
 
-    pub async fn _handle(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
+    async fn handle_frame(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -809,12 +809,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         &mut self,
         smsg: &SecureMessage,
     ) -> Result<(), anyhow::Error> {
-        let mut hmac = HmacSha256::new_from_slice(self.state.recv_hmac_key.as_ref().unwrap())?;
+        let key = self
+            .state
+            .recv_hmac_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("secure message before the key exchange"))?;
+        let mut hmac = HmacSha256::new_from_slice(key)?;
         hmac.update(&smsg.header_and_body);
-        let computed = hmac.finalize().into_bytes();
-        if computed[..] != smsg.signature[..] {
-            return Err(anyhow!("hmac!=signature"));
-        }
+        // Constant-time, so the comparison doesn't leak how much matched.
+        hmac.verify_slice(&smsg.signature)
+            .map_err(|_| anyhow!("hmac!=signature"))?;
 
         let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
 
@@ -863,38 +867,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                         trace!("Processing PayloadType::Bytes");
                         let payload_id = header.id();
 
-                        if header.total_size() > SANE_FRAME_LENGTH.into() {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Payload too large: {} bytes",
-                                header.total_size()
-                            ));
-                        }
-
-                        self.state
-                            .payload_buffers
-                            .entry(payload_id)
-                            .or_insert_with(|| Vec::with_capacity(header.total_size() as usize));
-
-                        // Get the current length of the buffer, if it exists, without holding a mutable borrow.
-                        let buffer_len = self.state.payload_buffers.get(&payload_id).unwrap().len();
-                        if chunk.offset() != buffer_len as i64 {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Unexpected chunk offset: {}, expected: {}",
-                                chunk.offset(),
-                                buffer_len
-                            ));
-                        }
-
-                        let buffer = self.state.payload_buffers.get_mut(&payload_id).unwrap();
-                        if let Some(body) = &chunk.body {
-                            buffer.extend(body);
-                        }
-
-                        if (chunk.flags() & 1) == 1 {
-                            debug!("Chunk flags & 1 == 1 ?? End of data ??");
-
+                        if let Some(buffer) = crate::hdl::buffer_bytes_chunk(
+                            &mut self.state.payload_buffers,
+                            payload_id,
+                            header.total_size(),
+                            chunk,
+                            SANE_FRAME_LENGTH as usize,
+                        )? {
                             let innner_frame = sharing_nearby::Frame::decode(buffer.as_slice())?;
                             self.process_transfer_setup(&innner_frame).await?;
                         }
@@ -1268,7 +1247,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                         // transfer".
                         id: Some(rand::rng().random::<i64>()),
                         payload_id: Some(rand::rng().random::<i64>()),
-                        name: Some(fname.to_os_string().into_string().unwrap()),
+                        name: Some(fname.to_string_lossy().into_owned()),
                         size: Some(fmetadata.len() as i64),
                         mime_type: Some(ftype),
                         r#type: Some(meta_type.into()),
@@ -1281,6 +1260,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                             bytes_transferred: 0,
                             total_size: fmeta.size(),
                             file: Some(file),
+                            ..Default::default()
                         },
                     );
                     file_metadata.push(fmeta);
@@ -1551,6 +1531,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                                     bytes_transferred: curr_state.bytes_transferred,
                                     total_size: curr_state.total_size,
                                     file: None,
+                                    ..Default::default()
                                 },
                                 buffer,
                                 bytes_read,

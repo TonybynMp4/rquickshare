@@ -241,7 +241,10 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
                             .and_then(|meta| meta.source.as_ref())
                             .map(|source| source.name.clone())
                             .unwrap_or_else(|| "Unknown".to_string());
+                        #[cfg(target_os = "linux")]
                         send_request_notification(name, info.id.clone(), &capp_handle);
+                        #[cfg(not(target_os = "linux"))]
+                        send_request_notification(name, &capp_handle);
                     }
                     // The card in the window already offers Copy/Open, so only
                     // notify when the user isn't looking at it.

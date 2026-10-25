@@ -23,21 +23,22 @@ use crate::cmds;
 /// Longest slice of a received text shown in its notification body.
 const TEXT_PREVIEW_CHARS: usize = 200;
 
+/// Freedesktop notification servers render a subset of HTML in the body
+/// (`<a href>`, `<img>`), and device names and shared text are the sender's to
+/// choose, so escape them before they go in.
+#[cfg(target_os = "linux")]
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Asks about an incoming transfer. On Linux the notification carries Accept
+/// and Reject buttons, so it needs the transfer's id to answer for it.
+#[cfg(target_os = "linux")]
 pub fn send_request_notification(name: String, id: String, app_handle: &AppHandle) {
-    // Is not used in macos, get rid of warning
-    let _ = id;
+    let body = format!("{} want to initiate a transfer", escape_markup(&name));
 
-    let body = format!("{name} want to initiate a transfer");
-
-    #[cfg(not(target_os = "linux"))]
-    let _ = app_handle
-        .notification()
-        .builder()
-        .title("RQuickShare")
-        .body(&body)
-        .show();
-
-    #[cfg(target_os = "linux")]
     match Notification::new()
         .summary("RQuickShare")
         .body(&body)
@@ -47,40 +48,51 @@ pub fn send_request_notification(name: String, id: String, app_handle: &AppHandl
     {
         Ok(n) => {
             let capp_handle = app_handle.clone();
-            // TODO - Meh, untracked, unwaited tasks...
-            #[cfg(target_os = "linux")]
             tokio::task::spawn(async move {
-                n.wait_for_action(|action| match action {
-                    "accept" => {
-                        let _ = cmds::send_to_rs(
-                            ChannelMessage {
-                                id,
-                                direction: ChannelDirection::FrontToLib,
-                                action: Some(ChannelAction::AcceptTransfer),
-                                ..Default::default()
-                            },
-                            capp_handle.state(),
-                        );
-                    }
-                    "reject" => {
-                        let _ = cmds::send_to_rs(
-                            ChannelMessage {
-                                id,
-                                direction: ChannelDirection::FrontToLib,
-                                action: Some(ChannelAction::RejectTransfer),
-                                ..Default::default()
-                            },
-                            capp_handle.state(),
-                        );
-                    }
-                    _ => (),
-                });
+                // wait_for_action blocks until the user clicks or the
+                // notification expires, so it can't sit on an async worker:
+                // a handful of pending requests would stall the runtime.
+                let chosen = tokio::task::spawn_blocking(move || {
+                    let mut chosen: Option<String> = None;
+                    n.wait_for_action(|action| chosen = Some(action.to_owned()));
+                    chosen
+                })
+                .await;
+
+                let action = match chosen.ok().flatten().as_deref() {
+                    Some("accept") => ChannelAction::AcceptTransfer,
+                    Some("reject") => ChannelAction::RejectTransfer,
+                    _ => return,
+                };
+                if let Err(e) = cmds::send_to_rs(
+                    ChannelMessage {
+                        id,
+                        direction: ChannelDirection::FrontToLib,
+                        action: Some(action),
+                        ..Default::default()
+                    },
+                    capp_handle.state(),
+                ) {
+                    error!("Couldn't answer the transfer request: {e}");
+                }
             });
         }
         Err(e) => {
             error!("Couldn't show notification: {}", e);
         }
     }
+}
+
+/// Elsewhere the notification plugin has no action buttons, so it only says
+/// who is asking; the answer comes from the window.
+#[cfg(not(target_os = "linux"))]
+pub fn send_request_notification(name: String, app_handle: &AppHandle) {
+    let _ = app_handle
+        .notification()
+        .builder()
+        .title("RQuickShare")
+        .body(format!("{name} want to initiate a transfer"))
+        .show();
 }
 
 pub fn send_temporarily_notification(app_handle: &AppHandle) {
@@ -107,8 +119,6 @@ pub fn send_temporarily_notification(app_handle: &AppHandle) {
     {
         Ok(n) => {
             let capp_handle = app_handle.clone();
-            // TODO - Meh, untracked, unwaited tasks...
-            #[cfg(target_os = "linux")]
             tokio::task::spawn(async move {
                 // wait_for_action blocks until the user clicks or the
                 // notification expires, so it can't sit on an async worker.
@@ -174,7 +184,9 @@ pub fn send_text_notification(
             && (text.starts_with("https://") || text.starts_with("http://"));
 
         let mut notification = Notification::new();
-        notification.summary(&summary).body(&body);
+        notification
+            .summary(&escape_markup(&summary))
+            .body(&escape_markup(&body));
         if openable {
             notification.action("open", "Open");
         }

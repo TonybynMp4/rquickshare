@@ -364,17 +364,13 @@ pub fn gen_random(size: usize) -> Vec<u8> {
 }
 
 pub fn get_download_dir() -> PathBuf {
-    let cdown = CUSTOM_DOWNLOAD.read();
-    match cdown {
-        Ok(mg) => {
-            if mg.is_some() {
-                return mg.as_ref().unwrap().to_path_buf();
-            }
-        }
-        Err(_) => {
-            // TODO
-        }
+    // A writer that panicked can't have left a half-written PathBuf behind, so
+    // a poisoned lock still holds a usable value.
+    let custom = CUSTOM_DOWNLOAD.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(dir) = custom.as_ref() {
+        return dir.clone();
     }
+    drop(custom);
 
     if let Some(user_dirs) = directories::UserDirs::new() {
         if let Some(dd) = user_dirs.download_dir() {
@@ -385,6 +381,76 @@ pub fn get_download_dir() -> PathBuf {
     }
 
     Path::new("/").to_path_buf()
+}
+
+/// Turns a file name sent by a peer into one that is safe to create inside the
+/// download directory.
+///
+/// The name comes straight off the wire. Pushed onto a `PathBuf` as-is, an
+/// absolute name replaces the download directory and `..` climbs out of it,
+/// so a nearby device could write anywhere the user can - a Startup-folder
+/// script on Windows, `~/.config/autostart` on Linux. Only the last path
+/// component survives here, with the characters and names Windows can't
+/// create (or would read as an alternate data stream or a device) replaced.
+/// The same rules apply on every OS so a transfer saves under the same name
+/// everywhere.
+pub fn sanitize_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+
+    let mut clean: String = last
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+
+    // Windows drops trailing dots and spaces, which would make "a.txt." and
+    // "a.txt" the same file.
+    let trimmed_len = clean.trim_end_matches(['.', ' ']).len();
+    clean.truncate(trimmed_len);
+
+    if clean.is_empty() {
+        return "file".to_owned();
+    }
+
+    let stem = clean.split('.').next().unwrap_or_default();
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+    ) || (stem.len() == 4
+        && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        clean.insert(0, '_');
+    }
+
+    clean
+}
+
+/// Creates `name` in `dir` without touching anything already there, prefixing
+/// `1_`, `2_`, ... until a free name is found. `create_new` makes the check
+/// and the creation one step, so a file that appears while the user is
+/// deciding, or a second file of the same name in this transfer, is never
+/// truncated.
+pub fn create_unique_file(dir: &Path, name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut candidate = dir.join(name);
+    let mut counter = 0u32;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                counter += 1;
+                candidate = dir.join(format!("{counter}_{name}"));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 pub fn is_not_self_ip(ip_address: &IpAddr) -> bool {

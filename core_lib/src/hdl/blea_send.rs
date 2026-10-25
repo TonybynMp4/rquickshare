@@ -45,7 +45,7 @@ const MAX_PACKET_SIZE: u16 = 509;
 /// handshake that dies. Platforms that can report the real MTU never use this.
 ///
 /// Windows-only because only Windows asks for the negotiated MTU at all;
-/// elsewhere `proposed_packet_size` goes straight to `MAX_PACKET_SIZE`.
+/// elsewhere the sender offers `MAX_PACKET_SIZE`.
 #[cfg(target_os = "windows")]
 const FALLBACK_PACKET_SIZE: u16 = 20;
 
@@ -57,37 +57,27 @@ const FALLBACK_PACKET_SIZE: u16 = 20;
 /// here - the stack fragments our writes for us - it fails at the peer, whose
 /// oversized notification dies with GATT status 133 and takes the Weave socket
 /// with it, mid-UKEY2, with no prompt ever shown.
+#[cfg(target_os = "windows")]
 async fn proposed_packet_size(peripheral: &Peripheral) -> u16 {
     // A hook to override this size once existed, to test whether the handshake
     // failures were about notification size. They are not: the handshake failed
     // and succeeded identically at 509 B and at 100 B. Removed rather than left
     // lying around, since it answers a question that has been answered.
-    #[cfg(target_os = "windows")]
-    {
-        let addr = peripheral.address().into_inner();
-        let address =
-            u64::from_be_bytes([0, 0, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]]);
-        match crate::hdl::negotiated_att_mtu(address).await {
-            Some(mtu) => {
-                let size = mtu.saturating_sub(3).min(MAX_PACKET_SIZE);
-                info!(
-                    "{INNER_NAME}: link negotiated a {mtu} B ATT MTU; proposing {size} B packets"
-                );
-                size
-            }
-            None => {
-                warn!(
-                    "{INNER_NAME}: could not read the negotiated ATT MTU; proposing \
-                     {FALLBACK_PACKET_SIZE} B packets, which every LE link can carry"
-                );
-                FALLBACK_PACKET_SIZE
-            }
+    let addr = peripheral.address().into_inner();
+    let address = u64::from_be_bytes([0, 0, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]]);
+    match crate::hdl::negotiated_att_mtu(address).await {
+        Some(mtu) => {
+            let size = mtu.saturating_sub(3).min(MAX_PACKET_SIZE);
+            info!("{INNER_NAME}: link negotiated a {mtu} B ATT MTU; proposing {size} B packets");
+            size
         }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = peripheral;
-        MAX_PACKET_SIZE
+        None => {
+            warn!(
+                "{INNER_NAME}: could not read the negotiated ATT MTU; proposing \
+                 {FALLBACK_PACKET_SIZE} B packets, which every LE link can carry"
+            );
+            FALLBACK_PACKET_SIZE
+        }
     }
 }
 
@@ -204,7 +194,11 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
 
     // Weave ConnectionRequest. Counter 0 - control and data share one counter
     // per direction, which the receive path learned the hard way.
+    // Only Windows reads the negotiated MTU; elsewhere we offer the ceiling.
+    #[cfg(target_os = "windows")]
     let proposed = proposed_packet_size(&peripheral).await;
+    #[cfg(not(target_os = "windows"))]
+    let proposed = MAX_PACKET_SIZE;
     let request = [
         0x80,
         0x00,
@@ -438,6 +432,14 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
                         acc.clear();
                     }
                     acc.extend_from_slice(&n.value[1..]);
+                    if acc.len() > super::ble_receiver::MAX_WEAVE_MESSAGE {
+                        warn!(
+                            "{INNER_NAME}: Weave message from the peer passed {} B without ending; dropping it",
+                            super::ble_receiver::MAX_WEAVE_MESSAGE
+                        );
+                        acc.clear();
+                        continue;
+                    }
                     if header & 0x04 == 0 {
                         continue;
                     }

@@ -65,8 +65,9 @@ use crate::securemessage::{
 };
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
 use crate::utils::{
-    decode_point, derive_d2d_keys, encode_point, gen_ecdsa_keypair, gen_random, get_download_dir,
-    stream_read_exact, to_four_digit_string, D2DKeys, DeviceType, RemoteDeviceInfo,
+    create_unique_file, decode_point, derive_d2d_keys, encode_point, gen_ecdsa_keypair, gen_random,
+    get_download_dir, sanitize_file_name, to_four_digit_string, D2DKeys, DeviceType,
+    RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
@@ -166,7 +167,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                 server_seq: 0,
                 client_seq: 0,
                 state: State::Initial,
-                encryption_done: true,
+                encryption_done: false,
                 ..Default::default()
             },
             sender,
@@ -274,7 +275,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             // Whichever loses simply hasn't consumed its message yet.
             frame = self.frames.recv() => {
                 match frame {
-                    Some(frame_data) => self._handle(frame_data).await?,
+                    Some(frame_data) => self.handle_frame(frame_data).await?,
                     // The reader task ended: the transport is finished.
                     None => return Err(anyhow!(std::io::Error::from(
                         std::io::ErrorKind::UnexpectedEof
@@ -286,7 +287,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         Ok(())
     }
 
-    pub async fn _handle(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
+    async fn handle_frame(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -1247,7 +1248,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         Ok(())
     }
 
-    #[cfg(not(all(feature = "experimental", target_os = "windows")))]
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
     async fn offer_wifi_hotspot_upgrade(&mut self) -> Result<(), anyhow::Error> {
         Ok(())
     }
@@ -1442,29 +1443,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         &mut self,
         smsg: &SecureMessage,
     ) -> Result<(), anyhow::Error> {
-        let _prof_t = std::time::Instant::now();
-        let mut hmac = HmacSha256::new_from_slice(self.state.recv_hmac_key.as_ref().unwrap())?;
+        let prof_t = std::time::Instant::now();
+        let key = self
+            .state
+            .recv_hmac_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("secure message before the key exchange"))?;
+        let mut hmac = HmacSha256::new_from_slice(key)?;
         hmac.update(&smsg.header_and_body);
-        let computed = hmac.finalize().into_bytes();
-        if computed[..] != smsg.signature[..] {
-            return Err(anyhow!("hmac!=signature"));
-        }
+        // Constant-time, so the comparison doesn't leak how much matched.
+        hmac.verify_slice(&smsg.signature)
+            .map_err(|_| anyhow!("hmac!=signature"))?;
 
         let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
 
         let msg_data = header_and_body.body;
         let key = self.state.decrypt_key.as_ref().unwrap();
 
-        let _prof_a = std::time::Instant::now();
+        let prof_a = std::time::Instant::now();
         let decrypted =
             crate::hdl::aes256_cbc_decrypt(key, header_and_body.header.iv(), &msg_data)?;
-        self.prof_aes += _prof_a.elapsed();
+        self.prof_aes += prof_a.elapsed();
 
         let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
-        // Everything from _prof_t is HMAC + AES + protobuf decode - the CPU cost
+        // Everything from prof_t is HMAC + AES + protobuf decode - the CPU cost
         // of a frame; prof_aes isolates just the AES within it. Accumulate for
         // the throughput report at the file write.
-        self.prof_decrypt += _prof_t.elapsed();
+        self.prof_decrypt += prof_t.elapsed();
 
         let seq = self.get_client_seq_inc().await;
         if d2d_msg.sequence_number() != seq {
@@ -1502,42 +1507,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                         info!("Processing PayloadType::Bytes");
                         let payload_id = header.id();
 
-                        if header.total_size() > SANE_FRAME_LENGTH.into() {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Payload too large: {} bytes",
-                                header.total_size()
-                            ));
-                        }
+                        let Some(buffer) = crate::hdl::buffer_bytes_chunk(
+                            &mut self.state.payload_buffers,
+                            payload_id,
+                            header.total_size(),
+                            chunk,
+                            SANE_FRAME_LENGTH as usize,
+                        )?
+                        else {
+                            return Ok(());
+                        };
 
-                        self.state
-                            .payload_buffers
-                            .entry(payload_id)
-                            .or_insert_with(|| Vec::with_capacity(header.total_size() as usize));
-
-                        // Get the current length of the buffer, if it exists, without holding a mutable borrow.
-                        let buffer_len = self.state.payload_buffers.get(&payload_id).unwrap().len();
-                        if chunk.offset() != buffer_len as i64 {
-                            self.state.payload_buffers.remove(&payload_id);
-                            return Err(anyhow!(
-                                "Unexpected chunk offset: {}, expected: {}",
-                                chunk.offset(),
-                                buffer_len
-                            ));
-                        }
-
-                        let buffer = self.state.payload_buffers.get_mut(&payload_id).unwrap();
-                        if let Some(body) = &chunk.body {
-                            buffer.extend(body);
-                        }
-
-                        if (chunk.flags() & 1) == 1 {
-                            debug!("Chunk flags & 1 == 1 ?? End of data ??");
-
+                        {
                             if self.state.text_payload.is_some()
                                 && self.state.text_payload.as_ref().unwrap().get_i64_value()
                                     == payload_id
                             {
+                                // The text is the transfer, so it is only
+                                // shown once the user has accepted it.
+                                if self.state.state != State::ReceivingFiles {
+                                    return Err(anyhow!(
+                                        "text payload arrived before the transfer was accepted"
+                                    ));
+                                }
                                 info!("Transfer finished");
                                 let end_index =
                                     buffer.iter().position(|&b| b == 16).unwrap_or(buffer.len());
@@ -1628,13 +1620,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                             ));
                         }
 
+                        // Files are only opened once the user accepts; a
+                        // chunk before that is the peer skipping consent.
+                        let Some(file) = file_internal.file.as_ref() else {
+                            return Err(anyhow!(
+                                "file payload {payload_id} arrived before the transfer was accepted"
+                            ));
+                        };
+
                         if !chunk.body().is_empty() {
-                            let _prof_w = std::time::Instant::now();
-                            write_all_at(
-                                file_internal.file.as_ref().unwrap(),
-                                chunk.body(),
-                                current_offset as u64,
-                            )?;
+                            let prof_w = std::time::Instant::now();
+                            write_all_at(file, chunk.body(), current_offset as u64)?;
                             file_internal.bytes_transferred += chunk_size as i64;
 
                             // Throughput profiling. Split wall-clock into
@@ -1644,7 +1640,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                             // ceiling is our CPU (decrypt), our disk (write), or
                             // neither - i.e. the network/link is simply not
                             // delivering faster.
-                            self.prof_write += _prof_w.elapsed();
+                            self.prof_write += prof_w.elapsed();
                             self.prof_bytes += chunk_size as u64;
                             let now = std::time::Instant::now();
                             let since = *self.prof_since.get_or_insert(now);
@@ -1695,6 +1691,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                             )
                             .await;
                         } else if (chunk.flags() & 1) == 1 {
+                            if file_internal.bytes_transferred != file_internal.total_size {
+                                return Err(anyhow!(
+                                    "file payload {payload_id} ended after {} of {} bytes",
+                                    file_internal.bytes_transferred,
+                                    file_internal.total_size
+                                ));
+                            }
                             self.state.transferred_files.remove(&payload_id);
                             if self.state.transferred_files.is_empty() {
                                 info!("Transfer finished");
@@ -1780,7 +1783,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                     }
                 }
 
-                if is_path_request {
+                // Upgrading starts the Mobile Hotspot and hands its password
+                // to the peer, so only for a transfer the user accepted, and
+                // only when the transport can adopt the new socket. Accepting
+                // offers the paths itself, so an earlier request loses nothing.
+                if is_path_request
+                    && (!self.can_upgrade() || self.state.state != State::ReceivingFiles)
+                {
+                    debug!("Bandwidth upgrade: ignoring a path request before the transfer was accepted");
+                } else if is_path_request {
                     // WIFI_HOTSPOT, not WIFI_DIRECT. Windows can only host
                     // WIFI_DIRECT_WITH_DEVICE_NAME, which needs Wi-Fi P2P device
                     // discovery and never completed against this phone; a
@@ -2001,44 +2012,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             let mut total_bytes: u64 = 0;
 
             for file in &introduction.file_metadata {
-                info!("File name: {}", file.name());
+                // The name is the peer's to choose; see sanitize_file_name.
+                let name = sanitize_file_name(file.name());
+                info!("File name: {:?}, saved as {name:?}", file.name());
 
-                let mut dest = get_download_dir();
-                dest.push(file.name());
-
-                info!("Destination: {:?}", dest);
-                if dest.exists() {
-                    let mut counter = 1;
-                    dest.pop();
-
-                    loop {
-                        dest.push(format!("{}_{}", counter, file.name()));
-                        if !dest.exists() {
-                            break;
-                        }
-                        dest.pop();
-                        counter += 1;
-                    }
-
-                    info!("New destination: {:?}", dest);
+                if file.size() < 0 {
+                    return Err(anyhow!("file {name:?} has a negative size"));
                 }
 
-                self.state.saved_files.push(
-                    dest.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| file.name().to_owned()),
-                );
+                // The real name, with a 1_/2_ prefix if this one is taken, is
+                // picked when the file is created at accept time.
+                self.state.saved_files.push(name.clone());
 
                 let info = InternalFileInfo {
                     payload_id: file.payload_id(),
-                    file_url: dest,
+                    name: name.clone(),
+                    saved_index: self.state.saved_files.len() - 1,
+                    file_url: std::path::PathBuf::new(),
                     bytes_transferred: 0,
                     total_size: file.size(),
                     file: None,
                 };
                 total_bytes += info.total_size as u64;
                 self.state.transferred_files.insert(file.payload_id(), info);
-                files_name.push(file.name().to_owned());
+                files_name.push(name);
             }
 
             let metadata = TransferMetadata {
@@ -2179,14 +2176,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         }
     }
 
+    /// Whether this transport can adopt an upgraded socket (only BLE on
+    /// Windows and Linux can).
+    fn can_upgrade(&self) -> bool {
+        #[cfg(all(
+            feature = "experimental",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        return self.upgrade_tx.is_some();
+        #[cfg(not(all(
+            feature = "experimental",
+            any(target_os = "linux", target_os = "windows")
+        )))]
+        return false;
+    }
+
     async fn accept_transfer(&mut self) -> Result<(), anyhow::Error> {
         let ids: Vec<i64> = self.state.transferred_files.keys().cloned().collect();
 
+        let dir = get_download_dir();
         for id in ids {
             let mfi = self.state.transferred_files.get_mut(&id).unwrap();
 
-            let file = File::create(&mfi.file_url)?;
-            info!("Created file: {file:?}");
+            let (path, file) = create_unique_file(&dir, &mfi.name)?;
+            info!("Created file: {path:?}");
+            if let Some(saved) = path.file_name() {
+                self.state.saved_files[mfi.saved_index] = saved.to_string_lossy().into_owned();
+            }
+            mfi.file_url = path;
             mfi.file = Some(file);
         }
 
@@ -2229,18 +2246,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         // new socket, while this request carried on reading the old one - the
         // stream desynced and the next frame died with "SecureMessage.
         // header_and_body: invalid wire type".
-        #[cfg(all(
-            feature = "experimental",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        let can_upgrade = self.upgrade_tx.is_some();
-        #[cfg(not(all(
-            feature = "experimental",
-            any(target_os = "linux", target_os = "windows")
-        )))]
-        let can_upgrade = false;
-
-        if !can_upgrade {
+        if !self.can_upgrade() {
             debug!("Bandwidth upgrade: transport cannot adopt an upgraded socket, not offering");
         } else if std::env::var("RQS_TRY_WIFI_DIRECT_UPGRADE").is_ok() {
             if let Err(e) = self.offer_wifi_direct_upgrade().await {
@@ -2356,7 +2362,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         };
 
         let data = Ukey2Message {
-            message_type: Some(atype.into()),
+            message_type: Some(ukey2_message::Type::Alert.into()),
             message_data: Some(alert.encode_to_vec()),
         };
 
@@ -2603,10 +2609,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
 /// it, so `tokio::spawn` would demand `S: Send + 'static` from an impl that
 /// doesn't promise it.
 ///
-/// Stops at the ACK for now. The swap itself (LAST_WRITE_TO_PRIOR_CHANNEL ->
-/// SAFE_TO_CLOSE_PRIOR_CHANNEL, then moving the encrypted stream across) is
-/// still to build, so the phone will introduce itself, get its ACK, and then
-/// wait for a move that never comes. The transfer continues on WiFi-LAN.
+/// Returns the socket once the introduction is ACKed. The caller splices it in
+/// after LAST_WRITE_TO_PRIOR_CHANNEL / SAFE_TO_CLOSE_PRIOR_CHANNEL.
 #[cfg(all(
     feature = "experimental",
     any(target_os = "linux", target_os = "windows")
@@ -2618,6 +2622,7 @@ pub(crate) async fn introduce_upgraded_channel(
         ClientIntroductionAck, EventType,
     };
     use crate::location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+    use crate::utils::stream_read_exact;
 
     let mut length_buf = [0u8; 4];
     stream_read_exact(&mut socket, &mut length_buf).await?;
@@ -2672,15 +2677,15 @@ pub(crate) async fn introduce_upgraded_channel(
     Ok(socket)
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "experimental",
+    any(target_os = "linux", target_os = "windows")
+))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(all(
-        feature = "experimental",
-        any(target_os = "linux", target_os = "windows")
-    ))]
     fn test_lan_ipv4_resolves_valid_address() {
         let ip = InboundRequest::<tokio::net::TcpStream>::lan_ipv4();
         println!("Resolved LAN IPv4: {:?}", ip);

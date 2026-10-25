@@ -50,6 +50,34 @@ pub struct TcpServer {
     outbound_inflight: Arc<Mutex<HashSet<String>>>,
 }
 
+/// Takes a send's id out of `outbound_inflight` when dropped.
+struct InflightGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// What the BLE send path hands `drive_outbound` so a transfer can move onto
+/// WiFi: where the upgraded socket arrives, the release signal, and the splice
+/// notification. Only Windows can join the phone's hotspot, so elsewhere the
+/// type has no values and a send always stays on the transport it started on.
+#[cfg(all(feature = "experimental", target_os = "windows"))]
+type UpgradeSinks = (
+    tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
+    tokio::sync::mpsc::UnboundedSender<()>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+#[cfg(not(all(feature = "experimental", target_os = "windows")))]
+type UpgradeSinks = std::convert::Infallible;
+
 impl TcpServer {
     pub fn new(
         endpoint_id: [u8; 4],
@@ -98,6 +126,11 @@ impl TcpServer {
                     let inflight = self.outbound_inflight.clone();
 
                     tokio::spawn(async move {
+                        // Released however the task ends, a panic included;
+                        // otherwise every later send to this device would be
+                        // ignored as a duplicate until restart.
+                        let _inflight = InflightGuard { set: inflight, id: id.clone() };
+
                         if let Err(e) = Self::connect(endpoint_id, sender.clone(), cctk, i).await {
                             error!("{INNER_NAME}: error sending: {e}");
 
@@ -114,8 +147,6 @@ impl TcpServer {
                                 ..Default::default()
                             });
                         }
-
-                        inflight.lock().unwrap().remove(&id);
                     });
                 }
                 r = self.tcp_listener.accept() => {
@@ -235,12 +266,13 @@ impl TcpServer {
             #[cfg(feature = "experimental")]
             let _pause = crate::hdl::DiscoveryPause::new();
 
-            let (stream, upgrade_tx, switch_tx, switched) = (
+            #[cfg(target_os = "windows")]
+            let (stream, upgrade_sinks) = (
                 channel.stream,
-                channel.upgrade_tx,
-                channel.switch_tx,
-                channel.switched,
+                Some((channel.upgrade_tx, channel.switch_tx, channel.switched)),
             );
+            #[cfg(not(target_os = "windows"))]
+            let (stream, upgrade_sinks) = (channel.stream, None);
             // 8 KB, not the default 512 KB. Nothing else happens while a chunk
             // is being written, so the chunk size is also the granularity at
             // which this transport can react to anything.
@@ -273,7 +305,7 @@ impl TcpServer {
                 si,
                 stream,
                 Some(8 * 1024),
-                Some((upgrade_tx, switch_tx, switched)),
+                upgrade_sinks,
             )
             .await;
         }
@@ -291,11 +323,7 @@ impl TcpServer {
         si: SendInfo,
         stream: S,
         chunk_size: Option<usize>,
-        #[allow(unused_variables)] upgrade_sinks: Option<(
-            tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
-            tokio::sync::mpsc::UnboundedSender<()>,
-            std::sync::Arc<tokio::sync::Notify>,
-        )>,
+        upgrade_sinks: Option<UpgradeSinks>,
     ) -> Result<(), anyhow::Error>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -319,9 +347,14 @@ impl TcpServer {
         if let Some(n) = chunk_size {
             or.set_chunk_size(n);
         }
-        #[cfg(all(feature = "experimental", target_os = "windows"))]
-        if let Some((upgrade_tx, switch_tx, switched)) = upgrade_sinks {
-            or.set_upgrade_sinks(upgrade_tx, switch_tx, switched);
+        if let Some(sinks) = upgrade_sinks {
+            #[cfg(all(feature = "experimental", target_os = "windows"))]
+            {
+                let (upgrade_tx, switch_tx, switched) = sinks;
+                or.set_upgrade_sinks(upgrade_tx, switch_tx, switched);
+            }
+            #[cfg(not(all(feature = "experimental", target_os = "windows")))]
+            match sinks {}
         }
 
         // Send connection request

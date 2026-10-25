@@ -954,6 +954,14 @@ impl BleReceiverAdvertiser {
                                 st.acc.clear();
                             }
                             st.acc.extend_from_slice(&pkt[1..]);
+                            if st.acc.len() > super::ble_receiver::MAX_WEAVE_MESSAGE {
+                                warn!(
+                                    "{INNER_NAME}: REASSEMBLY - message passed {} B without ending; dropping it",
+                                    super::ble_receiver::MAX_WEAVE_MESSAGE
+                                );
+                                st.acc.clear();
+                                continue;
+                            }
                             // Per-packet logging runs *inside* the WinRT write
                             // callback, so its cost is paid on the thread that
                             // has to drain the BLE receive queue. At ~35
