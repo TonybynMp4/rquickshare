@@ -397,3 +397,69 @@ async fn loopback_text_send_ends_on_the_receivers_hang_up() {
         "outbound waited out its grace period instead of seeing the hang-up"
     );
 }
+
+mod bytes_payload_buffers {
+    use std::collections::HashMap;
+
+    use crate::hdl::buffer_bytes_chunk;
+    use crate::location_nearby_connections::payload_transfer_frame::PayloadChunk;
+
+    const MAX: usize = 1024;
+
+    fn chunk(offset: i64, body: &[u8], last: bool) -> PayloadChunk {
+        PayloadChunk {
+            flags: Some(if last { 1 } else { 0 }),
+            offset: Some(offset),
+            body: Some(body.to_vec()),
+        }
+    }
+
+    #[test]
+    fn reassembles_and_frees_the_buffer() {
+        let mut buffers = HashMap::new();
+        assert_eq!(
+            buffer_bytes_chunk(&mut buffers, 7, 6, &chunk(0, b"abc", false), MAX).unwrap(),
+            None
+        );
+        let done = buffer_bytes_chunk(&mut buffers, 7, 6, &chunk(3, b"def", true), MAX).unwrap();
+        assert_eq!(done.as_deref(), Some(&b"abcdef"[..]));
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn rejects_negative_and_oversized_declarations() {
+        let mut buffers = HashMap::new();
+        assert!(buffer_bytes_chunk(&mut buffers, 1, -1, &chunk(0, b"x", true), MAX).is_err());
+        assert!(
+            buffer_bytes_chunk(&mut buffers, 1, MAX as i64 + 1, &chunk(0, b"x", true), MAX)
+                .is_err()
+        );
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn rejects_growing_past_the_declared_size() {
+        let mut buffers = HashMap::new();
+        buffer_bytes_chunk(&mut buffers, 1, 4, &chunk(0, b"abc", false), MAX).unwrap();
+        assert!(buffer_bytes_chunk(&mut buffers, 1, 4, &chunk(3, b"de", false), MAX).is_err());
+        assert!(buffers.is_empty());
+    }
+
+    #[test]
+    fn caps_the_total_across_payload_ids() {
+        let mut buffers = HashMap::new();
+        let half = vec![0u8; MAX / 2];
+        buffer_bytes_chunk(&mut buffers, 1, MAX as i64, &chunk(0, &half, false), MAX).unwrap();
+        buffer_bytes_chunk(&mut buffers, 2, MAX as i64, &chunk(0, &half, false), MAX).unwrap();
+        assert!(
+            buffer_bytes_chunk(&mut buffers, 3, MAX as i64, &chunk(0, b"x", false), MAX).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_offset() {
+        let mut buffers = HashMap::new();
+        buffer_bytes_chunk(&mut buffers, 1, 10, &chunk(0, b"abc", false), MAX).unwrap();
+        assert!(buffer_bytes_chunk(&mut buffers, 1, 10, &chunk(5, b"x", false), MAX).is_err());
+    }
+}

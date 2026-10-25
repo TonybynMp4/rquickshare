@@ -782,4 +782,53 @@ mod tests {
         // TEST-NET-3: reserved for documentation, never on a real interface.
         assert!(is_not_self_ip(&"203.0.113.1".parse().unwrap()));
     }
+
+    #[test]
+    fn sanitize_file_name_keeps_only_the_last_component() {
+        assert_eq!(sanitize_file_name("photo.jpg"), "photo.jpg");
+        assert_eq!(
+            sanitize_file_name("../../.config/autostart/x.desktop"),
+            "x.desktop"
+        );
+        assert_eq!(
+            sanitize_file_name(r"..\..\AppData\Roaming\Microsoft\x.bat"),
+            "x.bat"
+        );
+        assert_eq!(sanitize_file_name(r"C:\Windows\evil.dll"), "evil.dll");
+        assert_eq!(sanitize_file_name("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name(".."), "file");
+        assert_eq!(sanitize_file_name(""), "file");
+        assert_eq!(sanitize_file_name("dir/"), "file");
+    }
+
+    #[test]
+    fn sanitize_file_name_replaces_what_windows_cannot_create() {
+        assert_eq!(sanitize_file_name("a:stream"), "a_stream");
+        assert_eq!(sanitize_file_name("what?.txt"), "what_.txt");
+        assert_eq!(sanitize_file_name("tab\there"), "tab_here");
+        assert_eq!(sanitize_file_name("trailing.txt. "), "trailing.txt");
+        assert_eq!(sanitize_file_name("CON"), "_CON");
+        assert_eq!(sanitize_file_name("nul.txt"), "_nul.txt");
+        assert_eq!(sanitize_file_name("COM1.log"), "_COM1.log");
+        assert_eq!(sanitize_file_name("COMPUTER.txt"), "COMPUTER.txt");
+        assert_eq!(sanitize_file_name("résumé.pdf"), "résumé.pdf");
+    }
+
+    #[test]
+    fn create_unique_file_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("rqs-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (first, _) = create_unique_file(&dir, "same.txt").unwrap();
+        std::fs::write(&first, b"keep me").unwrap();
+        let (second, _) = create_unique_file(&dir, "same.txt").unwrap();
+        let (third, _) = create_unique_file(&dir, "same.txt").unwrap();
+
+        assert_eq!(first.file_name().unwrap(), "same.txt");
+        assert_eq!(second.file_name().unwrap(), "1_same.txt");
+        assert_eq!(third.file_name().unwrap(), "2_same.txt");
+        assert_eq!(std::fs::read(&first).unwrap(), b"keep me");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
