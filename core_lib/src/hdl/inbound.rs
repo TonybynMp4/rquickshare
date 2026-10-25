@@ -74,7 +74,6 @@ use crate::{location_nearby_connections, sharing_nearby};
 type HmacSha256 = Hmac<Sha256>;
 
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
-const SANITY_DURATION: Duration = Duration::from_micros(10);
 
 /// Generic over the transport so the handshake can be driven by a test over an
 /// in-memory duplex pair, not just a real socket. In production `S` is always
@@ -2589,10 +2588,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             meta: self.state.transfer_metadata.clone(),
             ..Default::default()
         });
-        // Add a small sleep timer to allow the Tokio runtime to have
-        // some spare time to process channel's message. Otherwise it
-        // get spammed by new requests. Currently set to 10 micro secs.
-        tokio::time::sleep(SANITY_DURATION).await;
+        // Let the receivers run before the next update. This was a 10us sleep,
+        // which tokio rounds up to a whole millisecond per update; yielding
+        // hands the turn over without a timer.
+        tokio::task::yield_now().await;
     }
 }
 
