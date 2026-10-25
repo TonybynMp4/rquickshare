@@ -4,7 +4,6 @@ import { autostartKey, clipboardAutosyncKey, debugLevelKey, DisplayedItem, downl
 import { SendInfo } from '@martichou/core_lib/bindings/SendInfo';
 import { ChannelMessage } from '@martichou/core_lib/bindings/ChannelMessage';
 import { ChannelAction } from '@martichou/core_lib';
-import { gt } from 'semver';
 
 // Not `_`-prefixed: setup() exposes this on the component, and Vue reserves the
 // `_` and `$` prefixes for its internals (it warns and skips them).
@@ -245,9 +244,29 @@ async function getDownloadPath(vm: TauriVM) {
 	vm.downloadPath = await vm.store.get(downloadPathKey) ?? undefined;
 }
 
+// A release is versioned 1.26.298.42 (major, year, day of the year, build).
+// Cargo only takes three numbers, so the app itself reports 1.26.298+42; show
+// it the way the release and its installers spell it.
+function displayVersion(version: string): string {
+	return version.replace('+', '.');
+}
+
+// Compares two dotted versions number by number; a missing part counts as 0,
+// so a local 1.0.0 build is older than any 1.y.z.w release.
+function isNewerVersion(candidate: string, current: string): boolean {
+	const a = candidate.split('.').map(Number);
+	const b = current.split('.').map(Number);
+	if (a.some(Number.isNaN) || b.some(Number.isNaN)) return false;
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		const diff = (a[i] ?? 0) - (b[i] ?? 0);
+		if (diff !== 0) return diff > 0;
+	}
+	return false;
+}
+
 async function getLatestVersion(vm: TauriVM) {
 	try {
-		const response = await fetch('https://api.github.com/repos/martichou/rquickshare/releases/latest');
+		const response = await fetch('https://api.github.com/repos/asulwer/rquickshare/releases/latest');
 		if (!response.ok) {
 			throw new Error(`Error: ${response.status} ${response.statusText}`);
 		}
@@ -255,7 +274,7 @@ async function getLatestVersion(vm: TauriVM) {
 		const new_version = data.tag_name.substring(1);
 		console.log(`Latest version: ${vm.version} vs ${new_version}`);
 
-		if (vm.version && gt(new_version, vm.version)) {
+		if (vm.version && isNewerVersion(new_version, vm.version)) {
 			vm.new_version = new_version;
 		}
 	} catch (err) {
@@ -286,6 +305,7 @@ export const utils = {
 	setDeviceName,
 	getDeviceName,
 	getLatestVersion,
+	displayVersion,
 	setStartMinimized,
 	getStartMinimized,
 	setNearbyAlerts,

@@ -316,7 +316,7 @@ export default {
 		nextTick(async () => {
 			try {
 				await this.getDeviceName(this);
-				this.version = await getVersion();
+				this.version = this.displayVersion(await getVersion());
 
 				await this.getVisibility(this);
 

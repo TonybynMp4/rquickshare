@@ -1,66 +1,89 @@
-name: Create Release
+name: Release
 
-# Builds the installers for a tag and attaches them to that tag's release.
+# Builds the installers and publishes a release. Start it from the Actions tab:
+# Release > Run workflow.
 #
-# Normally called by release-please.yml right after it creates a release.
-# Pushing a tag does not start this on its own any more: that trigger only
-# worked with a PAT, because GitHub never lets the built-in token's tag pushes
-# start other workflows. Run it by hand to rebuild or re-attach a release.
+# The version is <major>.<YY>.<DDD>.<build>, e.g. 1.26.298.42:
+#   major  The [workspace.package] version's first number in Cargo.toml.
+#          Changed by hand only (`pnpm bump major`).
+#   YY     Two-digit year, in UTC, when the run starts.
+#   DDD    Day of the year (1-366), in UTC. 26.298 is October 25, 2026.
+#   build  This workflow's run number. It only goes up, so two releases on the
+#          same day still get increasing versions.
+#
+# The tag, the release, the installer file names, the .msi and .exe installers
+# and the version the app shows all read 1.26.298.42. Cargo only takes three
+# numbers, so Cargo.toml gets 1.26.298+42 and Tauri turns the +42 back into the
+# fourth number for the Windows installers.
 on:
-  workflow_call:
-    inputs:
-      tag_name:
-        description: 'Tag to build'
-        type: string
-        required: true
-      publish:
-        description: 'Attach the installers to the release for this tag'
-        type: boolean
-        default: true
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: 'Tag to build'
-        required: true
       publish:
         description: >-
-          Attach the installers to the existing GitHub release for this tag.
-          Off: artifacts only, nothing is published.
+          Tag the commit and publish a GitHub release with the installers.
+          Off: build only, and keep the installers as workflow artifacts.
         type: boolean
-        default: false
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  # Runs first and alone: a tag that disagrees with the manifest means the
-  # release would ship binaries whose in-app version is wrong, and that is far
-  # cheaper to catch here than after publishing.
-  verify:
+  version:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      cargo_version: ${{ steps.version.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag_name }}
-      - name: Tag matches the workspace version
+      - id: version
+        name: Work out the version
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          tag="${{ inputs.tag_name }}"
-          manifest=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
-            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -n1)
-          if [ -z "$manifest" ]; then
-            echo "::error::could not read [workspace.package] version from Cargo.toml"
-            exit 1
-          fi
-          echo "tag=${tag} manifest=v${manifest}"
-          if [ "$tag" != "v${manifest}" ]; then
-            echo "::error::tag ${tag} does not match Cargo.toml version v${manifest}"
+          if [ "$PUBLISH" = "true" ] && [ "$GITHUB_REF" != "refs/heads/master" ]; then
+            echo "::error::releases are published from master only; untick publish to build ${GITHUB_REF_NAME}"
             exit 1
           fi
 
-  build_release:
-    needs: verify
+          major=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\([0-9]\{1,\}\)\..*"/\1/p' | head -n1)
+          if [ -z "$major" ]; then
+            echo "::error::could not read the major version from [workspace.package] in Cargo.toml"
+            exit 1
+          fi
+          # The .msi caps the first two numbers at 255 and the others at 65535.
+          if [ "$major" -gt 255 ]; then
+            echo "::error::major version ${major} is over 255, the most an .msi allows"
+            exit 1
+          fi
+          if [ "$RUN_NUMBER" -gt 65535 ]; then
+            echo "::error::run number ${RUN_NUMBER} is over 65535, the most a Windows file version allows"
+            exit 1
+          fi
+
+          yy=$(date -u +%y)
+          ddd=$(date -u +%j)
+          # 10# reads them as decimal, so the leading zeros of a day like 009
+          # aren't taken for octal and don't end up in the version.
+          date_part="${major}.$((10#${yy})).$((10#${ddd}))"
+          version="${date_part}.${RUN_NUMBER}"
+          cargo_version="${date_part}+${RUN_NUMBER}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v${version}" > /dev/null; then
+            echo "::error::tag v${version} already exists"
+            exit 1
+          fi
+
+          echo "version ${version} (Cargo.toml ${cargo_version})"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "cargo_version=${cargo_version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # Uploading release assets needs write access to the repo's contents.
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -81,10 +104,10 @@ jobs:
       # target/, not app/main/src-tauri/target/.
       BUNDLE_DIR: target/release/bundle
       BUNDLE_NAME: main
+      VERSION: ${{ needs.version.outputs.version }}
+      CARGO_VERSION: ${{ needs.version.outputs.cargo_version }}
     steps:
       - uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.tag_name }}
       - uses: pnpm/action-setup@v5
         with:
           package_json_file: app/main/package.json
@@ -104,6 +127,12 @@ jobs:
       - uses: ./.github/actions/linux-deps
         if: runner.os == 'Linux'
 
+      # Only in this checkout; the version is never committed. The app and the
+      # installers take it from Cargo.toml.
+      - name: Stamp the version
+        shell: bash
+        run: node scripts/bump.mjs "$CARGO_VERSION"
+
       - name: Build Vite + Tauri
         # bash everywhere, including Windows (Git Bash), where the default
         # shell would be PowerShell.
@@ -117,38 +146,46 @@ jobs:
           (cd "${TARGET_PATH}" && pnpm install --frozen-lockfile && pnpm build ${BUNDLES:+--bundles "$BUNDLES"})
           ./rename_build.sh "${BUNDLE_DIR}" "${BUNDLE_NAME}"
 
-      # Always when release-please calls this; on a manual run only when
-      # `publish` is ticked.
-      #
-      # `gh release upload` only adds assets. softprops/action-gh-release
-      # edited the release before uploading, and GitHub refused that edit
-      # whatever token was used. gh is preinstalled on GitHub-hosted runners.
-      #
-      # The upload uses the built-in GITHUB_TOKEN (contents: write, above):
-      # GitHub creates it per run, so it never expires.
-      - name: Add files to release
-        if: inputs.publish
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag_name }}
-        run: |
-          shopt -s nullglob
-          files=( "${BUNDLE_DIR}"/*/r-quick-share-"${BUNDLE_NAME}"* )
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::no installers found under ${BUNDLE_DIR}"
-            exit 1
-          fi
-          printf 'uploading %s\n' "${files[@]}"
-          # --clobber replaces an asset of the same name, so re-running is safe.
-          gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
-
-      # Manual runs only. Inside a call from release-please.yml, event_name is
-      # the caller's ("push"), so release builds skip this.
-      - name: Upload artifacts
-        if: github.event_name == 'workflow_dispatch'
+      - name: Upload installers
         uses: actions/upload-artifact@v6
         with:
-          name: artifact-release-rquickshare-${{ matrix.os }}
+          name: rquickshare-${{ env.VERSION }}-${{ matrix.os }}
           path: ${{ env.BUNDLE_DIR }}/*/r-quick-share-${{ env.BUNDLE_NAME }}*
           if-no-files-found: error
+
+  # Runs only once every OS has built, so a release never goes out with some of
+  # its installers missing.
+  publish:
+    needs: [version, build]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    # Creating the tag and the release, and uploading to it.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: installers
+          pattern: rquickshare-${{ needs.version.outputs.version }}-*
+          merge-multiple: true
+      # The built-in GITHUB_TOKEN: GitHub creates it per run, so there's
+      # nothing to renew. gh is preinstalled on GitHub-hosted runners.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ needs.version.outputs.version }}
+        run: |
+          shopt -s nullglob globstar
+          files=( installers/**/r-quick-share-* )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no installers were downloaded"
+            exit 1
+          fi
+          printf 'attaching %s\n' "${files[@]}"
+          # Tags the exact commit that was built. The notes list the pull
+          # requests merged since the previous release.
+          gh release create "$TAG" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --generate-notes

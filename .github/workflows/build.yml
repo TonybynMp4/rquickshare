@@ -26,8 +26,8 @@ jobs:
             # Only the .deb. This workflow proves the app still packages; one
             # Linux format shows that as well as three. The AppImage step bundles
             # all of WebKitGTK and GTK around an unstripped debug binary and
-            # compresses it - most of the Linux job's time. release.yml still
-            # builds .deb, .rpm and AppImage for releases.
+            # compresses it - most of the Linux job's time. release.yml builds
+            # .deb and .rpm for releases.
             bundles: deb
           # Apple Silicon. macos-13 (the Intel image) was retired: its jobs sat
           # queued for 24h and were cancelled, never running.
