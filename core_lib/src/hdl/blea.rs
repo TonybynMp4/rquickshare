@@ -14,6 +14,7 @@ const INNER_NAME: &str = "BleAdvertiser";
 
 #[derive(Debug, Clone)]
 pub struct BleAdvertiser {
+    session: bluer::Session,
     adapter: Arc<bluer::Adapter>,
 }
 
@@ -21,14 +22,25 @@ impl BleAdvertiser {
     pub async fn new() -> Result<Self, anyhow::Error> {
         let session = bluer::Session::new().await?;
         let adapter = session.default_adapter().await?;
-        adapter.set_powered(true).await?;
 
         Ok(Self {
+            session,
             adapter: Arc::new(adapter),
         })
     }
 
     pub async fn run(&self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        // Bluetooth being off is the user's choice. This used to power the
+        // adapter on at every send, overriding it; now it waits to be turned
+        // on instead.
+        if !self.adapter.is_powered().await? {
+            info!("{INNER_NAME}: Bluetooth is off; waiting for it to be turned on");
+            tokio::select! {
+                _ = ctk.cancelled() => return Ok(()),
+                _ = crate::hdl::bluetooth_turned_on(&self.session) => {}
+            }
+        }
+
         info!(
             "{INNER_NAME}: advertising on Bluetooth adapter {} with address {}",
             self.adapter.name(),
