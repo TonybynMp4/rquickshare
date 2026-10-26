@@ -252,16 +252,19 @@ pub struct OutboundRequest<S> {
     /// (WIFI_LAN).
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     join_started: bool,
-    /// Whether the running upgrade actually associated the WiFi adapter to the
-    /// peer's AP. Only the WIFI_HOTSPOT path does; the WIFI_LAN path just opens a
-    /// second TCP socket over the existing route. Cleanup disconnects WiFi only
-    /// when this is set, so a LAN upgrade never touches the adapter.
+    /// The peer's AP, once the WIFI_HOTSPOT join has actually associated to it;
+    /// written by the join task. Cleanup disconnects exactly this. It used to be
+    /// a flag set when the join *started*, so a transfer that never joined
+    /// anything still disconnected the PC's WiFi. The WIFI_LAN path never sets
+    /// it: it opens a second TCP socket over the existing route.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
-    joined_ap: bool,
-    /// The background join task, so it can be aborted if the transfer finishes
-    /// before it lands - otherwise a small file completes over BLE while we are
-    /// still associating, and the join leaks a WiFi connection into a transfer
-    /// that no longer exists.
+    joined_ap: std::sync::Arc<std::sync::Mutex<Option<crate::hdl::JoinedAp>>>,
+    /// Stops the upgrade task when the transfer ends, including the join's own
+    /// thread, which aborting the task never reached.
+    #[cfg(all(feature = "experimental", target_os = "windows"))]
+    join_cancel: tokio_util::sync::CancellationToken,
+    /// The background upgrade task, so cleanup can wait for it to stop - it has
+    /// to have recorded what it joined before cleanup can undo it.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     join_handle: Option<tokio::task::JoinHandle<()>>,
     /// How much file data goes into one payload chunk.
@@ -330,7 +333,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             join_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(feature = "experimental", target_os = "windows"))]
-            joined_ap: false,
+            joined_ap: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(all(feature = "experimental", target_os = "windows"))]
+            join_cancel: tokio_util::sync::CancellationToken::new(),
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             join_started: false,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
@@ -1014,7 +1019,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 //
                 // Opt-in (see the request block above). Whichever finishes first
                 // wins: if the upgrade lands we switch; if the file finishes
-                // first, cleanup_upgrade aborts it - no size threshold, the
+                // first, cleanup_upgrade stops it - no size threshold, the
                 // events decide.
                 #[cfg(all(feature = "experimental", target_os = "windows"))]
                 if let Some(info) = v1_frame
@@ -2092,8 +2097,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
     /// so the whole thing is event-driven: nothing waits on a fixed timer, and a
     /// slow join simply upgrades later rather than being abandoned.
     ///
-    /// This path associates the WiFi adapter to the peer's AP, so it sets
-    /// `joined_ap`: cleanup will disconnect the adapter afterwards. The
+    /// This path associates the WiFi adapter to the peer's AP, and records it in
+    /// `joined_ap` once it has: cleanup will disconnect it afterwards. The
     /// WIFI_LAN sibling (`spawn_lan_upgrade`) does not.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     fn spawn_join(
@@ -2118,17 +2123,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             return;
         };
         self.join_started = true;
-        self.joined_ap = true;
         let gateway = creds.gateway().to_string();
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
         let unencrypted = self.upgrade_unencrypted;
         let ready = self.join_ready.clone();
+        let joined_ap = self.joined_ap.clone();
+        let cancel = self.join_cancel.clone();
 
         self.join_handle = Some(tokio::spawn(async move {
-            let run = async {
-                info!("Bandwidth upgrade: joining the peer's network {ssid} (background)");
-                crate::hdl::join(&ssid, &password).await?;
+            info!("Bandwidth upgrade: joining the peer's network {ssid} (background)");
+            // Not raced against `cancel`: the join watches it itself and ends
+            // promptly, and it must get to record a network it did join, or
+            // nothing would ever leave it.
+            match crate::hdl::join(&ssid, &password, cancel.clone()).await {
+                Ok(joined) => match joined_ap.lock() {
+                    Ok(mut slot) => *slot = Some(joined),
+                    Err(e) => warn!("Bandwidth upgrade: could not record the join: {e}"),
+                },
+                Err(e) => {
+                    warn!("Bandwidth upgrade: join failed, staying on BLE: {e}");
+                    return;
+                }
+            }
 
+            let run = async {
                 // Association is not addressing: wait for a DHCP lease on the
                 // peer's subnet before connecting, or the connect has no route
                 // and hangs.
@@ -2165,11 +2183,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 introduce_over_upgraded_socket(socket, endpoint_id, unencrypted, upgrade_tx).await
             };
 
-            match run.await {
-                // Signal the main loop to send LAST_WRITE and complete the
-                // switch. Only on success - a failed join leaves us on BLE.
-                Ok(()) => ready.store(true, std::sync::atomic::Ordering::Relaxed),
-                Err(e) => warn!("Bandwidth upgrade: join failed, staying on BLE: {e}"),
+            tokio::select! {
+                r = run => match r {
+                    // Signal the main loop to send LAST_WRITE and complete the
+                    // switch. Only on success - a failed join leaves us on BLE.
+                    Ok(()) => ready.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Err(e) => warn!("Bandwidth upgrade: join failed, staying on BLE: {e}"),
+                },
+                _ = cancel.cancelled() => {
+                    info!("Bandwidth upgrade: the transfer ended before the upgrade did");
+                }
             }
         }));
     }
@@ -2200,6 +2223,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
         let unencrypted = self.upgrade_unencrypted;
         let ready = self.join_ready.clone();
+        let cancel = self.join_cancel.clone();
 
         self.join_handle = Some(tokio::spawn(async move {
             let run = async {
@@ -2234,28 +2258,45 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 introduce_over_upgraded_socket(socket, endpoint_id, unencrypted, upgrade_tx).await
             };
 
-            match run.await {
-                Ok(()) => ready.store(true, std::sync::atomic::Ordering::Relaxed),
-                Err(e) => warn!("Bandwidth upgrade: LAN connect failed, staying on BLE: {e}"),
+            tokio::select! {
+                r = run => match r {
+                    Ok(()) => ready.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Err(e) => warn!("Bandwidth upgrade: LAN connect failed, staying on BLE: {e}"),
+                },
+                _ = cancel.cancelled() => {
+                    info!("Bandwidth upgrade: the transfer ended before the upgrade did");
+                }
             }
         }));
     }
 
-    /// Abandon any in-flight or completed join and release the WiFi link.
+    /// Stop any in-flight upgrade and leave the peer's AP if we joined it.
     ///
-    /// Called when the transfer ends. If a small file finished over BLE while we
-    /// were still associating, the join task is aborted and the WiFi adapter is
-    /// disconnected from the peer's AP - otherwise the association (and the
-    /// default route it installs) would linger past the transfer.
+    /// Called when the transfer ends, by every path that ends it; safe to call
+    /// more than once. If a small file finished over BLE while we were still
+    /// associating, the join stops before connecting - or leaves again if it
+    /// had just connected - instead of joining the phone's network after the
+    /// transfer is over. Only then is the adapter disconnected, and only from
+    /// the network it joined.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
-    async fn cleanup_upgrade(&mut self) {
+    pub async fn cleanup_upgrade(&mut self) {
+        self.join_cancel.cancel();
+        // Wait rather than abort: the task must have recorded what it joined.
+        // It ends promptly once cancelled.
         if let Some(h) = self.join_handle.take() {
-            h.abort();
+            if let Err(e) = h.await {
+                warn!("Bandwidth upgrade: the upgrade task failed: {e}");
+            }
         }
-        // Only the WIFI_HOTSPOT path touches the adapter; a WIFI_LAN upgrade runs
-        // over the existing route and has nothing to disconnect.
-        if self.joined_ap {
-            crate::hdl::wifi_disconnect().await;
+        let joined = match self.joined_ap.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(e) => {
+                warn!("Bandwidth upgrade: could not read the join: {e}");
+                None
+            }
+        };
+        if let Some(joined) = joined {
+            crate::hdl::wifi_disconnect(joined).await;
         }
     }
 

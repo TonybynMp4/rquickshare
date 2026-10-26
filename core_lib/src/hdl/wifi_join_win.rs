@@ -19,7 +19,8 @@
 
 use std::sync::mpsc;
 
-use windows::core::{IInspectable, HSTRING};
+use tokio_util::sync::CancellationToken;
+use windows::core::{IInspectable, GUID, HSTRING};
 use windows::Devices::WiFi::{
     WiFiAdapter, WiFiAvailableNetwork, WiFiConnectionStatus, WiFiReconnectionKind,
 };
@@ -27,21 +28,54 @@ use windows::Foundation::TypedEventHandler;
 use windows::Security::Credentials::PasswordCredential;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-/// Connect to `ssid` with `password`, blocking until it succeeds or fails.
+/// The adapter a join connected and the network it joined, so cleanup can
+/// disconnect exactly that and nothing else.
+#[derive(Debug, Clone)]
+pub struct JoinedAp {
+    adapter_id: GUID,
+    ssid: String,
+}
+
+/// Connect to `ssid` with `password`, blocking until it succeeds, fails or
+/// `cancel` fires.
 ///
 /// Rejoining the previous network afterwards is left to Windows: the connection
 /// is made with `WiFiReconnectionKind::Manual`, so it is not persisted and the
 /// adapter returns to its usual network when this one goes away.
-pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+///
+/// The work runs on a thread of its own, which a dropped future cannot stop:
+/// aborting the task that awaited it left the thread scanning for up to 30 s,
+/// and it could still join the phone's network after the transfer was over.
+/// So the thread watches `cancel` itself - it wakes the scan wait, is checked
+/// before connecting, and a join that lands after it fired is undone.
+pub async fn join(
+    ssid: &str,
+    password: &str,
+    cancel: CancellationToken,
+) -> Result<JoinedAp, anyhow::Error> {
+    let (tx, rx) = mpsc::channel::<Result<JoinedAp, String>>();
     let (ssid, password) = (ssid.to_string(), password.to_string());
+    // Wakes the wait between scans: a change in the networks Windows sees, or
+    // the join being cancelled.
+    let (wake_tx, wake_rx) = mpsc::channel::<()>();
+    let wake_on_cancel = {
+        let cancel = cancel.clone();
+        let wake_tx = wake_tx.clone();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            wake_tx.send(()).ok();
+        })
+    };
 
     std::thread::spawn(move || {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // WinRT activation needs COM. Already initialized differently is not
+        // fatal here; anything worse shows up as the first WinRT call failing.
+        if let Err(e) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok() {
+            debug!("join: COM initialization: {e}");
         }
 
-        let result = (|| -> Result<(), anyhow::Error> {
+        let cancelled = || anyhow::anyhow!("the join was cancelled");
+        let result = (|| -> Result<JoinedAp, anyhow::Error> {
             let adapters = WiFiAdapter::FindAllAdaptersAsync()?.join()?;
             if adapters.Size()? == 0 {
                 return Err(anyhow::anyhow!("no WiFi adapter"));
@@ -59,12 +93,11 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
             // attempts is now a wait on AvailableNetworksChanged. If Windows
             // notices the AP on its own background scan during that gap we react
             // immediately instead of sleeping through it.
-            let (changed_tx, changed_rx) = std::sync::mpsc::channel::<()>();
             let token = adapter.AvailableNetworksChanged(&TypedEventHandler::<
                 WiFiAdapter,
                 IInspectable,
             >::new(move |_, _| {
-                let _ = changed_tx.send(());
+                wake_tx.send(()).ok();
                 Ok(())
             }))?;
 
@@ -84,6 +117,9 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
             // different strategy.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             let found = loop {
+                if cancel.is_cancelled() {
+                    break None;
+                }
                 adapter.ScanAsync()?.join()?;
                 if let Some(n) = find(&adapter)? {
                     break Some(n);
@@ -92,14 +128,25 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
                 if remaining.is_zero() {
                     break None;
                 }
-                // Woken by a change, or fall through and scan again.
-                let _ = changed_rx.recv_timeout(remaining.min(std::time::Duration::from_secs(2)));
+                // Woken by a change or a cancel, or fall through and scan again.
+                if wake_rx
+                    .recv_timeout(remaining.min(std::time::Duration::from_secs(2)))
+                    .is_ok()
+                    && cancel.is_cancelled()
+                {
+                    break None;
+                }
                 if let Some(n) = find(&adapter)? {
                     break Some(n);
                 }
             };
-            let _ = adapter.RemoveAvailableNetworksChanged(token);
+            if let Err(e) = adapter.RemoveAvailableNetworksChanged(token) {
+                debug!("join: could not remove the network watcher: {e}");
+            }
 
+            if cancel.is_cancelled() {
+                return Err(cancelled());
+            }
             let network = found
                 .ok_or_else(|| anyhow::anyhow!("peer's network {ssid} never appeared in a scan"))?;
 
@@ -117,39 +164,80 @@ pub async fn join(ssid: &str, password: &str) -> Result<(), anyhow::Error> {
                 .join()?;
 
             match outcome.ConnectionStatus()? {
-                WiFiConnectionStatus::Success => Ok(()),
-                other => Err(anyhow::anyhow!("could not join {ssid}: status {other:?}")),
+                WiFiConnectionStatus::Success => {}
+                other => return Err(anyhow::anyhow!("could not join {ssid}: status {other:?}")),
             }
+            // Cancelled while connecting: nobody is left to clean this up, so
+            // leave the phone's network again here.
+            if cancel.is_cancelled() {
+                adapter.Disconnect()?;
+                return Err(cancelled());
+            }
+            Ok(JoinedAp {
+                adapter_id: adapter.NetworkAdapter()?.NetworkAdapterId()?,
+                ssid: ssid.clone(),
+            })
         })();
 
-        let _ = tx.send(result.map_err(|e| e.to_string()));
+        // The receiver is gone only if `join` was dropped, and then nobody
+        // wants the answer.
+        tx.send(result.map_err(|e| e.to_string())).ok();
     });
 
     // Blocking recv on a blocking pool thread, so the executor keeps running -
     // stalling it here would break the in-flight frames on the old channel.
-    let outcome = tokio::task::spawn_blocking(move || rx.recv()).await??;
-    outcome.map_err(|e| anyhow::anyhow!(e))
+    let outcome = tokio::task::spawn_blocking(move || rx.recv()).await;
+    wake_on_cancel.abort();
+    outcome??.map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Disconnect the WiFi adapter from whatever it joined.
+/// Leave the phone's network after a transfer.
 ///
-/// Called when a transfer ends. Without it the PC stays associated to the
-/// phone's transfer-scoped AP - which also installs a default route that would
-/// blackhole the PC's traffic through a phone that has no internet.
-pub async fn wifi_disconnect() {
-    let _ = tokio::task::spawn_blocking(|| {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+/// Without it the PC stays associated to the phone's transfer-scoped AP, which
+/// also installs a default route that blackholes the PC's traffic through a
+/// phone that has no internet.
+///
+/// Only the adapter the join used, and only while it is still on the phone's
+/// network. This used to disconnect every WiFi adapter on the machine, so a
+/// transfer that never joined anything - a small file done over BLE while the
+/// join was still scanning - took the user off their own network.
+pub async fn wifi_disconnect(joined: JoinedAp) {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<bool, anyhow::Error> {
+        if let Err(e) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok() {
+            debug!("wifi_disconnect: COM initialization: {e}");
         }
-        if let Ok(adapters) = WiFiAdapter::FindAllAdaptersAsync().and_then(|op| op.join()) {
-            for i in 0..adapters.Size().unwrap_or(0) {
-                if let Ok(adapter) = adapters.GetAt(i) {
-                    adapter.Disconnect().ok();
-                }
+        let adapters = WiFiAdapter::FindAllAdaptersAsync()?.join()?;
+        for i in 0..adapters.Size()? {
+            let adapter = adapters.GetAt(i)?;
+            let network_adapter = adapter.NetworkAdapter()?;
+            if network_adapter.NetworkAdapterId()? != joined.adapter_id {
+                continue;
             }
+            // Not connected at all (no profile) also means nothing to undo.
+            let Ok(profile) = network_adapter
+                .GetConnectedProfileAsync()
+                .and_then(|op| op.join())
+            else {
+                return Ok(false);
+            };
+            let ssid = profile.WlanConnectionProfileDetails()?.GetConnectedSsid()?;
+            if ssid != joined.ssid {
+                // Windows has already moved it back to the user's network.
+                return Ok(false);
+            }
+            adapter.Disconnect()?;
+            return Ok(true);
         }
+        Ok(false)
     })
     .await;
+
+    match outcome {
+        Ok(Ok(true)) => info!("Bandwidth upgrade: left the peer's network"),
+        Ok(Ok(false)) => debug!("Bandwidth upgrade: already off the peer's network"),
+        Ok(Err(e)) => warn!("Bandwidth upgrade: could not leave the peer's network: {e}"),
+        Err(e) => warn!("Bandwidth upgrade: could not leave the peer's network: {e}"),
+    }
 }
 
 /// Wait until an interface holds an address on the same /24 as `gateway`.

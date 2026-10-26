@@ -496,6 +496,12 @@ impl TcpServer {
             }
         }
 
+        // Every way out of the loop above ends the transfer, shutdown through
+        // `ctk` included, so this is where a WiFi upgrade is undone for all of
+        // them. A second call after `handle` already did it is harmless.
+        #[cfg(all(feature = "experimental", target_os = "windows"))]
+        or.cleanup_upgrade().await;
+
         Ok(())
     }
 }
