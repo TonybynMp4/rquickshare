@@ -1,6 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
@@ -12,11 +11,6 @@ use ts_rs::TS;
 use crate::qr::QrSession;
 use crate::utils::{is_not_self_ip, parse_endpoint_info};
 use crate::DeviceType;
-
-/// How long to wait for a candidate address to accept a connection before
-/// moving to the next one. An unreachable candidate would otherwise block on
-/// the OS TCP timeout (seconds) and delay discovery on every resolve.
-const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// True for IPv6 link-local addresses (fe80::/10). Connecting to one requires a
 /// scope id identifying the interface, which we don't have here, so such a
@@ -76,13 +70,15 @@ impl MDnsDiscovery {
         // Map with fullname as key and EndpointInfo as value
         let mut cache: HashMap<String, EndpointInfo> = HashMap::new();
 
-        // Probing a peer's addresses takes up to `CONNECT_PROBE_TIMEOUT` each and
-        // used to happen inline, so one unreachable peer held up the resolve of
-        // every other peer behind it. Probes now run in their own tasks and report
-        // back here; `probing` keeps a peer from being probed twice at once, since
-        // mDNS re-resolves the same service repeatedly.
-        let (probe_tx, mut probe_rx) = mpsc::channel::<(String, Option<EndpointInfo>)>(32);
-        let mut probing: HashSet<String> = HashSet::new();
+        // Probing a peer's addresses can take as long as the OS connect timeout
+        // for an unreachable one, so probes run in their own tasks and report
+        // back here. `probing` keeps a peer from being probed twice at once,
+        // since mDNS re-resolves the same service repeatedly, and holds what is
+        // needed to abandon a probe: its generation, so a stale result is
+        // recognised, and its abort handle, for a peer removed mid-probe.
+        let (probe_tx, mut probe_rx) = mpsc::channel::<(String, u64, Option<EndpointInfo>)>(32);
+        let mut probing: HashMap<String, (u64, tokio::task::AbortHandle)> = HashMap::new();
+        let mut generation: u64 = 0;
 
         loop {
             tokio::select! {
@@ -152,21 +148,38 @@ impl MDnsDiscovery {
 
                                     let fullname = info.get_fullname().to_string();
 
-                                    if cache.contains_key(&fullname) || !probing.insert(fullname.clone()) {
+                                    // A cached peer is probed again only when this
+                                    // resolve moves it: a new address or port is
+                                    // otherwise ignored until ServiceRemoved.
+                                    if !needs_probe(cache.get(&fullname), &candidates, port)
+                                        || probing.contains_key(&fullname)
+                                    {
                                         continue;
                                     }
 
+                                    generation += 1;
+                                    let this_probe = generation;
                                     let tx = probe_tx.clone();
-                                    tokio::spawn(async move {
+                                    let probe_name = fullname.clone();
+                                    let task = tokio::spawn(async move {
                                         let ei = Self::probe_candidates(
-                                            &fullname, candidates, port, &dn, &dt, qr_match,
+                                            &probe_name, candidates, port, &dn, &dt, qr_match,
                                         )
                                         .await;
-                                        let _ = tx.send((fullname, ei)).await;
+                                        // The loop is gone only when discovery stops.
+                                        if tx.send((probe_name, this_probe, ei)).await.is_err() {
+                                            trace!("MDnsDiscovery: probe finished after discovery stopped");
+                                        }
                                     });
+                                    probing.insert(fullname, (this_probe, task.abort_handle()));
                                 }
                                 ServiceEvent::ServiceRemoved(_, fullname) => {
                                     trace!("ServiceRemoved: checking if should remove {}", fullname);
+                                    // Still being probed: drop the probe, or its result
+                                    // would add back a peer that has just gone.
+                                    if let Some((_, task)) = probing.remove(&fullname) {
+                                        task.abort();
+                                    }
                                     // Only remove if it has not been seen in the last cleanup_threshold
                                     let should_remove = cache.get(&fullname).map(|ei| ei.id.clone());
 
@@ -195,8 +208,15 @@ impl MDnsDiscovery {
                         }
                     }
                 }
-                Some((fullname, ei)) = probe_rx.recv() => {
-                    probing.remove(&fullname);
+                Some((fullname, this_probe, ei)) = probe_rx.recv() => {
+                    // Only the result of the probe still on record counts; one
+                    // that was abandoned (removed, or superseded) is dropped.
+                    match probing.get(&fullname) {
+                        Some((current, _)) if *current == this_probe => {
+                            probing.remove(&fullname);
+                        }
+                        _ => continue,
+                    }
 
                     // A peer none of whose addresses answered isn't cached, so the
                     // next resolve for it is probed again - it may just have been
@@ -214,7 +234,16 @@ impl MDnsDiscovery {
                     }
 
                     info!("ServiceResolved: Resolved a new service: {:?}", ei);
-                    cache.insert(fullname, ei.clone());
+                    // A re-probe that found the peer somewhere else: withdraw
+                    // the old entry, which the front end keys by address.
+                    if let Some(old) = cache.insert(fullname, ei.clone()) {
+                        if old.id != ei.id {
+                            let _ = self.sender.send(EndpointInfo {
+                                id: old.id,
+                                ..Default::default()
+                            });
+                        }
+                    }
                     let _ = self.sender.send(ei);
                 }
             }
@@ -237,9 +266,11 @@ impl MDnsDiscovery {
     /// Return the first of `candidates` that accepts a connection, as the
     /// `EndpointInfo` the front end can send to, or `None` if none of them does.
     ///
-    /// Always run from its own task: with several candidates this can take a few
-    /// times `CONNECT_PROBE_TIMEOUT`, and on the discovery loop that stalled every
-    /// other peer waiting to be resolved.
+    /// All candidates are tried at once and the first to connect wins; the rest
+    /// are abandoned when the task set drops. Trying them in turn needed a
+    /// per-address timeout so an unreachable one couldn't stall the reachable
+    /// one behind it. Always run from its own task: when no candidate answers,
+    /// this lasts as long as the OS connect timeout.
     async fn probe_candidates(
         fullname: &str,
         candidates: Vec<IpAddr>,
@@ -248,15 +279,27 @@ impl MDnsDiscovery {
         device_type: &DeviceType,
         qr_match: bool,
     ) -> Option<EndpointInfo> {
+        let mut attempts = tokio::task::JoinSet::new();
         for ip in candidates {
-            let addr = SocketAddr::new(ip, port);
-            match tokio::time::timeout(CONNECT_PROBE_TIMEOUT, TcpStream::connect(addr)).await {
-                Ok(Ok(_)) => {}
-                _ => {
-                    trace!("ServiceResolved: {addr} unreachable, trying next candidate");
+            attempts.spawn(async move {
+                let addr = SocketAddr::new(ip, port);
+                TcpStream::connect(addr).await.map(|_| addr)
+            });
+        }
+
+        while let Some(attempt) = attempts.join_next().await {
+            let addr = match attempt {
+                Ok(Ok(addr)) => addr,
+                Ok(Err(e)) => {
+                    trace!("ServiceResolved: a candidate for {fullname} is unreachable: {e}");
                     continue;
                 }
-            }
+                Err(e) => {
+                    warn!("ServiceResolved: probe task failed: {e}");
+                    continue;
+                }
+            };
+            let ip = addr.ip();
 
             // The frontend builds its target as `ip + ":" + port`, so an IPv6
             // literal has to carry its brackets.
@@ -278,5 +321,70 @@ impl MDnsDiscovery {
         }
 
         None
+    }
+}
+
+/// Whether a resolve should be probed: always for a peer we haven't cached,
+/// and for a cached one only when the address we reach it on is no longer
+/// among those it advertises, or its port changed.
+fn needs_probe(cached: Option<&EndpointInfo>, candidates: &[IpAddr], port: u16) -> bool {
+    let Some(cached) = cached else {
+        return true;
+    };
+    match cached.id.parse::<SocketAddr>() {
+        Ok(reached) => reached.port() != port || !candidates.contains(&reached.ip()),
+        Err(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached(id: &str) -> EndpointInfo {
+        EndpointInfo {
+            id: id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cached_peer_is_probed_again_only_when_it_moves() {
+        let ip: IpAddr = "192.168.1.20".parse().unwrap();
+        let other: IpAddr = "192.168.1.21".parse().unwrap();
+        let peer = cached("192.168.1.20:5000");
+
+        assert!(needs_probe(None, &[ip], 5000));
+        assert!(!needs_probe(Some(&peer), &[ip], 5000));
+        assert!(!needs_probe(Some(&peer), &[other, ip], 5000));
+        assert!(needs_probe(Some(&peer), &[ip], 5001));
+        assert!(needs_probe(Some(&peer), &[other], 5000));
+    }
+
+    /// An address that never answers must not hold up one that does.
+    #[tokio::test]
+    async fn an_unreachable_candidate_does_not_delay_a_reachable_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // TEST-NET-1: routable-looking, never answers, so its connect hangs.
+        let unreachable: IpAddr = "192.0.2.1".parse().unwrap();
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let found = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MDnsDiscovery::probe_candidates(
+                "peer",
+                vec![unreachable, local],
+                port,
+                "Phone",
+                &DeviceType::Phone,
+                false,
+            ),
+        )
+        .await
+        .expect("the unreachable candidate held up the probe")
+        .expect("the reachable candidate wasn't found");
+        assert_eq!(found.ip.as_deref(), Some("127.0.0.1"));
+        drop(listener);
     }
 }
