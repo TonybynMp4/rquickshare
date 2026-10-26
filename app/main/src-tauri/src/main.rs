@@ -370,21 +370,24 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state: tauri::State<'_, AppState> = capp_handle.state();
         let mut ble_receiver = state.ble_receiver.resubscribe();
-        let mut last_sent = std::time::Instant::now() - std::time::Duration::from_secs(120);
 
         loop {
             let rinfo = ble_receiver.recv().await;
 
             match rinfo {
+                // One event per sharing session: the listener raises it when a
+                // phone starts sharing and not again until every address that
+                // phone used has stopped advertising. So notify on each one.
+                // This used to be held to one per 120 s as well, which let a
+                // clock rather than the phone decide when to tell the user.
+                // Linux shows it under a fixed id, so a new one replaces one
+                // still on screen instead of stacking.
                 Ok(_) => {
                     let v = get_visibility(&capp_handle);
                     trace!("Tauri: ble received: {:?}", v);
 
-                    if v == Visibility::Invisible
-                        && last_sent.elapsed() >= std::time::Duration::from_secs(120)
-                    {
+                    if v == Visibility::Invisible {
                         send_temporarily_notification(&capp_handle);
-                        last_sent = std::time::Instant::now();
                     }
                 }
                 Err(e) => {
