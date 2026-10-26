@@ -97,6 +97,7 @@ fn send_wifi_upgrade_enabled() -> bool {
 async fn introduce_over_upgraded_socket(
     mut socket: tokio::net::TcpStream,
     endpoint_id: String,
+    unencrypted: bool,
     upgrade_tx: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
 ) -> Result<(), anyhow::Error> {
     use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
@@ -116,7 +117,7 @@ async fn introduce_over_upgraded_socket(
                 event_type: Some(EventType::ClientIntroduction.into()),
                 client_introduction: Some(ClientIntroduction {
                     endpoint_id: Some(endpoint_id),
-                    supports_disabling_encryption: Some(false),
+                    supports_disabling_encryption: Some(unencrypted),
                 }),
                 ..Default::default()
             }),
@@ -221,6 +222,23 @@ pub struct OutboundRequest<S> {
     /// send loop stops waiting for one and proceeds.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     upgraded: bool,
+    /// Whether the peer's upgrade offer allows running the upgraded channel
+    /// without encryption (`supports_disabling_encryption`).
+    #[cfg(all(feature = "experimental", target_os = "windows"))]
+    upgrade_unencrypted: bool,
+    /// Frames go out and come in as plain `OfflineFrame`s, without the
+    /// UKEY2 encryption around them.
+    ///
+    /// Set when the stream moves onto an upgraded channel whose offer allowed
+    /// it. The phone decides that on its own: a Pixel offering
+    /// `supports_disabling_encryption: true` runs the new channel as plain
+    /// WIFI_HOTSPOT even when our CLIENT_INTRODUCTION says false ("ignoring wire
+    /// CLIENT_INTRODUCTION.supportsDisablingEncryption=false ... using local
+    /// intent true"). Encrypted frames sent there were each discarded as an
+    /// "invalid OfflineFrame", so the file stopped at the bytes BLE had carried
+    /// while we reported the transfer finished. Google's own client turns
+    /// encryption off in the same case.
+    unencrypted: bool,
     /// Set by the background join task once it has joined the peer's AP,
     /// connected, introduced itself and handed the socket to the transport - the
     /// point at which LAST_WRITE_TO_PRIOR_CHANNEL should go out. An *event*, not
@@ -307,6 +325,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             upgraded: false,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
+            upgrade_unencrypted: false,
+            unencrypted: false,
+            #[cfg(all(feature = "experimental", target_os = "windows"))]
             join_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             joined_ap: false,
@@ -342,10 +363,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
         let r = self.handle_next().await;
-        // The session is over once the peer hangs up after a completed send;
-        // only now is it safe to drop the WiFi link it may be running over.
+        // Every error ends the session, a completed send included (the peer's
+        // hang-up comes back as one); only now is it safe to drop the WiFi link
+        // it may be running over. A send the peer never confirmed ends as
+        // Disconnected and must not leave us on its hotspot either.
         #[cfg(all(feature = "experimental", target_os = "windows"))]
-        if r.is_err() && self.state.state == State::Finished {
+        if r.is_err() {
             self.cleanup_upgrade().await;
         }
         r
@@ -357,7 +380,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             _ = tokio::time::sleep_until(hang_up_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if hang_up_deadline.is_some() =>
             {
-                info!("Peer did not hang up after the transfer; disconnecting");
+                // Everything went out, but the receiver never confirmed it, and
+                // it always does when it has the data. Measured: an upgraded
+                // send whose frames the phone discarded ended exactly here,
+                // with 98304 bytes on the phone and "Finished" on our screen.
+                warn!("Peer did not hang up after the transfer; it did not confirm receipt");
+                self.update_state(
+                    |e| {
+                        e.state = State::Disconnected;
+                    },
+                    true,
+                )
+                .await;
                 self.disconnection().await?;
                 return Err(anyhow!(crate::errors::AppError::NotAnError));
             },
@@ -399,6 +433,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             frame = self.frames.recv() => {
                 match frame {
                     Some(frame_data) => self.handle_frame(frame_data).await?,
+                    // Closing the connection once everything is sent is a
+                    // hang-up too, just without the DISCONNECTION frame.
+                    None if hang_up_deadline.is_some() => {
+                        self.peer_disconnected().await;
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
+                    }
                     None => return Err(anyhow!(std::io::Error::from(
                         std::io::ErrorKind::UnexpectedEof
                     ))),
@@ -539,16 +579,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
                 self.process_connection_response(&frame).await?;
 
-                // Advance current state
+                // Both connection responses are out; the next frame is the
+                // receiver's paired key encryption.
                 self.update_state(
                     |e: &mut InnerState| {
-                        e.state = State::SentPairedKeyEncryption;
+                        e.state = State::SentConnectionResponse;
                         e.server_init_data = Some(frame_data);
                         e.encryption_done = true;
                     },
                     false,
                 )
                 .await;
+            }
+            _ if self.unencrypted => {
+                let offline = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
+                self.process_offline_frame(offline).await?;
             }
             _ => {
                 debug!("Handling SecureMessage frame");
@@ -579,6 +624,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                             }) == Some(true)
                             {
                                 info!("Peer sent an unencrypted disconnect, ending session");
+                                self.peer_disconnected().await;
                                 return Err(anyhow!(crate::errors::AppError::NotAnError));
                             }
                         }
@@ -804,21 +850,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             return Err(anyhow!("Connection rejected by third party"));
         }
 
-        let paired_encryption = sharing_nearby::Frame {
-            version: Some(sharing_nearby::frame::Version::V1.into()),
-            v1: Some(sharing_nearby::V1Frame {
-                r#type: Some(sharing_nearby::v1_frame::FrameType::PairedKeyEncryption.into()),
-                paired_key_encryption: Some(sharing_nearby::PairedKeyEncryptionFrame {
-                    secret_id_hash: Some(gen_random(6)),
-                    signed_data: Some(gen_random(72)),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-        };
-
-        self.send_encrypted_frame(&paired_encryption).await?;
-
+        // Nothing encrypted goes out yet: see
+        // `process_paired_key_encryption_frame`.
         Ok(())
     }
 
@@ -857,6 +890,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         }
 
         let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
+        self.process_offline_frame(offline).await
+    }
+
+    /// Handle one frame from the peer once it is plaintext: decrypted, or read
+    /// as-is from an upgraded channel the peer runs without encryption.
+    async fn process_offline_frame(
+        &mut self,
+        offline: location_nearby_connections::OfflineFrame,
+    ) -> Result<(), anyhow::Error> {
         let v1_frame = offline
             .v1
             .as_ref()
@@ -985,6 +1027,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     .and_then(|bun| bun.upgrade_path_info.as_ref())
                 {
                     if send_wifi_upgrade_enabled() {
+                        // Agree with the peer's choice in our introduction; it
+                        // applies it either way (see `unencrypted`).
+                        self.upgrade_unencrypted = info.supports_disabling_encryption();
                         let lan = info.wifi_lan_socket.as_ref().and_then(|s| {
                             let ip = s.ip_address();
                             // A port that doesn't fit is a bad offer, not one
@@ -1103,6 +1148,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 // The remote device closed the session (normal after a transfer
                 // completes). End cleanly rather than logging it as an error.
                 info!("Received disconnect frame, ending session");
+                self.peer_disconnected().await;
                 return Err(anyhow!(crate::errors::AppError::NotAnError));
             }
             _ => {
@@ -1111,6 +1157,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         }
 
         Ok(())
+    }
+
+    /// The peer hung up.
+    ///
+    /// Once everything is sent, that is the receiver confirming it has the
+    /// data, and only then is the transfer Finished. Anywhere earlier it is a
+    /// failure the UI has to be told about, or it keeps showing the last step
+    /// as if still working.
+    async fn peer_disconnected(&mut self) {
+        if matches!(
+            self.state.state,
+            State::Finished | State::Cancelled | State::Rejected | State::Disconnected
+        ) {
+            return;
+        }
+        let state = if self.hang_up_deadline.is_some() {
+            State::Finished
+        } else {
+            State::Disconnected
+        };
+        self.update_state(
+            |e| {
+                e.state = state;
+            },
+            true,
+        )
+        .await;
     }
 
     async fn process_transfer_setup(
@@ -1136,8 +1209,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         }
 
         match self.state.state {
-            State::SentPairedKeyEncryption => {
-                debug!("Processing State::SentPairedKeyEncryption");
+            State::SentConnectionResponse => {
+                debug!("Processing State::SentConnectionResponse");
                 self.process_paired_key_encryption_frame(v1_frame).await?;
                 self.update_state(
                     |e| {
@@ -1181,6 +1254,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         if v1_frame.paired_key_encryption.is_none() {
             return Err(anyhow!("Missing required fields"));
         }
+
+        // Ours goes out only now, in reply to the receiver's, because the
+        // receiver's is the first sign that its side of the channel is
+        // encrypted. A receiver switches to encryption only after sending its
+        // connection response, and sending ours the moment that response
+        // arrived could beat the switch over BLE: a Pixel then read our first
+        // encrypted frame as plaintext, dropped it ("invalid OfflineFrame"),
+        // rejected the next one with "Incorrect sequence number" and hung up
+        // before the user saw anything. Receivers, ours included, send theirs
+        // without waiting for the sender's.
+        let paired_encryption = sharing_nearby::Frame {
+            version: Some(sharing_nearby::frame::Version::V1.into()),
+            v1: Some(sharing_nearby::V1Frame {
+                r#type: Some(sharing_nearby::v1_frame::FrameType::PairedKeyEncryption.into()),
+                paired_key_encryption: Some(sharing_nearby::PairedKeyEncryptionFrame {
+                    secret_id_hash: Some(gen_random(6)),
+                    signed_data: Some(gen_random(72)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        self.send_encrypted_frame(&paired_encryption).await?;
 
         let paired_result = sharing_nearby::Frame {
             version: Some(sharing_nearby::frame::Version::V1.into()),
@@ -1356,12 +1452,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 // payload and finish (there are no files to loop over).
                 if let Some((payload_id, bytes)) = self.state.outbound_text.take() {
                     self.send_text_payload(payload_id, bytes).await?;
+                    // Finished only once the receiver confirms; see
+                    // `peer_disconnected`.
                     self.update_state(
                         |e| {
                             if let Some(tmd) = e.transfer_metadata.as_mut() {
                                 tmd.ack_bytes = tmd.total_bytes;
                             }
-                            e.state = State::Finished;
                         },
                         true,
                     )
@@ -1406,14 +1503,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     let current = match ids_iter.next() {
                         Some(i) => i,
                         None => {
-                            info!("All files have been transferred");
-                            self.update_state(
-                                |e| {
-                                    e.state = State::Finished;
-                                },
-                                true,
-                            )
-                            .await;
+                            // Sent is not received: Finished waits for the
+                            // receiver to confirm; see `peer_disconnected`.
+                            info!("All files sent; waiting for the receiver to confirm");
                             // Breaking instead of NotAnError so `handle` keeps
                             // reading until the peer hangs up.
                             self.await_peer_hang_up();
@@ -1918,6 +2010,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 
     async fn encrypt_and_send(&mut self, frame: &OfflineFrame) -> Result<(), anyhow::Error> {
         let plaintext = frame.encode_to_vec();
+        // See `unencrypted`: on such a channel the frame goes out as it is.
+        if self.unencrypted {
+            return self.send_frame(plaintext).await;
+        }
         let seq = self.get_server_seq_inc().await;
 
         // What we actually put on the wire, in order, with its sequence number.
@@ -2017,6 +2113,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         self.joined_ap = true;
         let gateway = creds.gateway().to_string();
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
+        let unencrypted = self.upgrade_unencrypted;
         let ready = self.join_ready.clone();
 
         self.join_handle = Some(tokio::spawn(async move {
@@ -2057,7 +2154,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     }
                 };
 
-                introduce_over_upgraded_socket(socket, endpoint_id, upgrade_tx).await
+                introduce_over_upgraded_socket(socket, endpoint_id, unencrypted, upgrade_tx).await
             };
 
             match run.await {
@@ -2093,6 +2190,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         };
         self.join_started = true;
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
+        let unencrypted = self.upgrade_unencrypted;
         let ready = self.join_ready.clone();
 
         self.join_handle = Some(tokio::spawn(async move {
@@ -2125,7 +2223,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     }
                 };
 
-                introduce_over_upgraded_socket(socket, endpoint_id, upgrade_tx).await
+                introduce_over_upgraded_socket(socket, endpoint_id, unencrypted, upgrade_tx).await
             };
 
             match run.await {
@@ -2202,13 +2300,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         }
 
         self.upgraded = true;
+        self.unencrypted = self.upgrade_unencrypted;
         // Back to large chunks. 32 KB was chosen so a BLE write couldn't
         // monopolise the loop for 25s; on WiFi that small size caps us at
         // ~40 KB/s, because the per-chunk fixed cost (encrypt, UI update,
         // keepalive service) dominates - roughly one chunk a second regardless
         // of link speed. A 512 KB chunk amortises that overhead ~16x.
         self.chunk_size = 512 * 1024;
-        info!("Bandwidth upgrade: switched to the new medium; raising chunk size");
+        info!(
+            "Bandwidth upgrade: switched to the new medium ({}); raising chunk size",
+            if self.unencrypted {
+                "unencrypted, as the peer offered"
+            } else {
+                "encrypted"
+            }
+        );
         Ok(())
     }
 
@@ -2456,5 +2562,114 @@ mod tests {
         ));
         assert_eq!(or.state.state, State::Cancelled);
         drop(theirs);
+    }
+
+    fn sender_with_everything_sent() -> (
+        OutboundRequest<tokio::io::DuplexStream>,
+        tokio::io::DuplexStream,
+    ) {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let mut or = OutboundRequest::new(
+            *b"abcd",
+            ours,
+            "send-1".to_owned(),
+            tokio::sync::broadcast::channel(16).0,
+            OutboundPayload::Text("hello".to_owned()),
+            RemoteDeviceInfo {
+                name: "peer".to_owned(),
+                device_type: DeviceType::Laptop,
+            },
+        );
+        or.state.state = State::SendingFiles;
+        or.await_peer_hang_up();
+        (or, theirs)
+    }
+
+    /// Writing the last byte is not delivery. The receiver closing the
+    /// connection afterwards is what confirms it, and only that is Finished.
+    #[tokio::test]
+    async fn the_receivers_close_after_the_last_byte_is_finished() {
+        let (mut or, theirs) = sender_with_everything_sent();
+        drop(theirs);
+
+        // The timeout only turns a hang into a failure.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), or.handle())
+            .await
+            .expect("the close was not read");
+        assert!(matches!(
+            ended
+                .expect_err("the close should end the session")
+                .downcast_ref(),
+            Some(crate::errors::AppError::NotAnError)
+        ));
+        assert_eq!(or.state.state, State::Finished);
+    }
+
+    /// A receiver that never confirms did not get the data: a phone that
+    /// discarded every frame after an upgrade behaved exactly like this.
+    #[tokio::test]
+    async fn no_confirmation_after_the_last_byte_is_not_finished() {
+        let (mut or, _theirs) = sender_with_everything_sent();
+        // Skip the grace period rather than wait it out.
+        or.hang_up_deadline = Some(tokio::time::Instant::now());
+
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), or.handle())
+            .await
+            .expect("the grace period did not end the session");
+        assert!(ended.is_err());
+        assert_eq!(or.state.state, State::Disconnected);
+    }
+
+    /// A peer that hangs up in the middle of the handshake ends the transfer
+    /// as Disconnected. It used to end it with the state untouched, so the UI
+    /// kept showing the last handshake step forever.
+    #[tokio::test]
+    async fn hang_up_during_the_handshake_reports_disconnected() {
+        use tokio::io::AsyncWriteExt;
+
+        let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let ui = tokio::sync::broadcast::channel(16).0;
+        let mut or = OutboundRequest::new(
+            *b"abcd",
+            ours,
+            "send-1".to_owned(),
+            ui,
+            OutboundPayload::Text("hello".to_owned()),
+            RemoteDeviceInfo {
+                name: "peer".to_owned(),
+                device_type: DeviceType::Laptop,
+            },
+        );
+        or.state.state = State::SentConnectionResponse;
+
+        // What a phone sends to hang up: a plaintext DISCONNECTION, length
+        // prefixed like every frame.
+        let bye = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::Disconnection.into(),
+                ),
+                disconnection: Some(location_nearby_connections::DisconnectionFrame::default()),
+                ..Default::default()
+            }),
+        }
+        .encode_to_vec();
+        theirs
+            .write_all(&(bye.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        theirs.write_all(&bye).await.unwrap();
+
+        // The timeout only turns a hang into a failure.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), or.await_next_frame())
+            .await
+            .expect("the hang-up was not read");
+        let err = ended.expect_err("a hang-up should end the transfer");
+        assert!(matches!(
+            err.downcast_ref(),
+            Some(crate::errors::AppError::NotAnError)
+        ));
+        assert_eq!(or.state.state, State::Disconnected);
     }
 }
