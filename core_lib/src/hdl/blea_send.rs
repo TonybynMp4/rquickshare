@@ -345,309 +345,330 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
         // one; see `multiplex_response_hash`.
         let mut refused = false;
 
-        let mux = build_multiplex_connection_request();
-        if let Err(e) = send_weave(&peripheral, &client_tx, &mux, &mut counter, max_payload).await {
-            warn!("{INNER_NAME}: failed to send multiplex ConnectionRequest: {e}");
-            return;
-        }
+        // The pump proper. Every way out of it - including the `return`s after a
+        // failed write and at the end of an upgraded transfer - lands on the
+        // disconnect below. Most of them used to return straight past it and
+        // leave the GATT link open, which stops the phone listing this PC.
+        let pump = async {
+            let mux = build_multiplex_connection_request();
+            if let Err(e) =
+                send_weave(&peripheral, &client_tx, &mux, &mut counter, max_payload).await
+            {
+                warn!("{INNER_NAME}: failed to send multiplex ConnectionRequest: {e}");
+                return;
+            }
 
-        loop {
-            let mut buf = [0u8; 8192];
-            tokio::select! {
-                // Outbound. `read` is cancel-safe; `read_exact` is not, which
-                // matters now that it shares a select with other branches.
-                r = far_rd.read(&mut buf) => {
-                    let n = match r {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => n,
-                    };
-                    pending.extend_from_slice(&buf[..n]);
+            loop {
+                let mut buf = [0u8; 8192];
+                tokio::select! {
+                    // Outbound. `read` is cancel-safe; `read_exact` is not, which
+                    // matters now that it shares a select with other branches.
+                    r = far_rd.read(&mut buf) => {
+                        let n = match r {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        pending.extend_from_slice(&buf[..n]);
 
-                    // Keep transmitting even once the upgraded socket is in
-                    // hand, right up until the switch is asked for.
-                    //
-                    // Tempting to hold everything back here the moment the
-                    // socket lands, on the grounds that the peer has already
-                    // promoted its channel. It is wrong: LAST_WRITE_TO_PRIOR
-                    // _CHANNEL has to go out over *this* channel, and holding it
-                    // back carried it onto the upgraded socket instead, where
-                    // the peer never saw it - so the peer sat waiting for the
-                    // old channel to be released, never started reading payload,
-                    // and reset the WiFi socket 65s later. The sender stops
-                    // writing payload on its own between LAST_WRITE and the
-                    // peer's SAFE_TO_CLOSE, which is the right place for that
-                    // decision: it knows which frames are protocol and which are
-                    // payload, and down here it is all opaque ciphertext.
-                    //
-                    // Send whole frames only. Nothing is read while a frame is
-                    // going out, because send_weave awaits each acknowledged
-                    // write - that is the backpressure.
-                    while pending.len() >= 4 {
-                        let len = u32::from_be_bytes(
-                            [pending[0], pending[1], pending[2], pending[3]],
-                        ) as usize;
-                        if len == 0 || len > SANE_FRAME_LENGTH {
-                            warn!("{INNER_NAME}: refusing insane outbound frame length {len}");
-                            return;
-                        }
-                        if pending.len() < 4 + len {
-                            break;
-                        }
-
-                        let mut msg = Vec::with_capacity(3 + 4 + len);
-                        msg.extend_from_slice(&hash);
-                        msg.extend_from_slice(&pending[..4 + len]);
-                        pending.drain(..4 + len);
-
-                        // One log line per multiplex message actually emitted,
-                        // with the counter it goes out under and how many Weave
-                        // packets it will take.
+                        // Keep transmitting even once the upgraded socket is in
+                        // hand, right up until the switch is asked for.
                         //
-                        // The peer discarded a frame with "invalid tag (zero)",
-                        // and the only zero bytes this side emits are the
-                        // four-byte length prefix - so at that moment the peer
-                        // was reading our prefix as frame content, four bytes
-                        // out of step. Whether that is one message emitted as
-                        // two, two merged into one, or a lost packet cannot be
-                        // told from the duplex side alone; this counts what
-                        // leaves, so it can be matched against what the peer
-                        // reads.
-                        trace!(
-                            "{INNER_NAME}: mux out: {} B total, declared len {len}, counter {}, \
-                             {} packet(s), beginning {:02x?}",
-                            msg.len(),
-                            counter,
-                            msg.len().div_ceil(max_payload),
-                            &msg[..msg.len().min(16)]
-                        );
+                        // Tempting to hold everything back here the moment the
+                        // socket lands, on the grounds that the peer has already
+                        // promoted its channel. It is wrong: LAST_WRITE_TO_PRIOR
+                        // _CHANNEL has to go out over *this* channel, and holding it
+                        // back carried it onto the upgraded socket instead, where
+                        // the peer never saw it - so the peer sat waiting for the
+                        // old channel to be released, never started reading payload,
+                        // and reset the WiFi socket 65s later. The sender stops
+                        // writing payload on its own between LAST_WRITE and the
+                        // peer's SAFE_TO_CLOSE, which is the right place for that
+                        // decision: it knows which frames are protocol and which are
+                        // payload, and down here it is all opaque ciphertext.
+                        //
+                        // Send whole frames only. Nothing is read while a frame is
+                        // going out, because send_weave awaits each acknowledged
+                        // write - that is the backpressure.
+                        while pending.len() >= 4 {
+                            let len = u32::from_be_bytes(
+                                [pending[0], pending[1], pending[2], pending[3]],
+                            ) as usize;
+                            if len == 0 || len > SANE_FRAME_LENGTH {
+                                warn!("{INNER_NAME}: refusing insane outbound frame length {len}");
+                                return;
+                            }
+                            if pending.len() < 4 + len {
+                                break;
+                            }
 
-                        if let Err(e) = send_weave(
-                            &peripheral, &client_tx, &msg, &mut counter, max_payload,
-                        ).await {
-                            warn!("{INNER_NAME}: weave send failed: {e}");
-                            return;
-                        }
-                    }
-                }
+                            let mut msg = Vec::with_capacity(3 + 4 + len);
+                            msg.extend_from_slice(&hash);
+                            msg.extend_from_slice(&pending[..4 + len]);
+                            pending.drain(..4 + len);
 
-                // Inbound.
-                note = notifications.next() => {
-                    let Some(n) = note else { break };
-                    if n.uuid != BLE_SOCKET_SERVER_TX_UUID || n.value.is_empty() {
-                        continue;
-                    }
-                    let header = n.value[0];
-
-                    // Check the counter before anything else: it is 3 bits, it
-                    // wraps, and control and data share one sequence per
-                    // direction - so a control packet consumes one too and
-                    // skipping it here would desynchronise the check itself.
-                    let got = (header >> 4) & 0x07;
-                    let expected = peer_counter;
-                    let lost = got != expected;
-                    // Resynchronise on what actually arrived, so one lost packet
-                    // costs one frame rather than every frame after it.
-                    peer_counter = (got + 1) & 0x07;
-
-                    if header & 0x80 != 0 {
-                        // Weave has no graceful close, so a completed transfer
-                        // ends with an Error just as a failed one does.
-                        if header & 0x0f == 2 {
-                            info!("{INNER_NAME}: peer closed the Weave connection");
-                            break;
-                        }
-                        continue;
-                    }
-
-                    if lost {
-                        // Reassembling across a hole produces bytes that are not
-                        // a frame at all. Say so here, where it is a lost BLE
-                        // packet, instead of letting it become an unexplained
-                        // protobuf failure several layers up.
-                        warn!(
-                            "{INNER_NAME}: lost a Weave packet from the peer (expected counter \
-                             {expected}, got {got}); dropping the partial frame"
-                        );
-                        acc.clear();
-                        continue;
-                    }
-
-                    if header & 0x08 != 0 {
-                        acc.clear();
-                    }
-                    acc.extend_from_slice(&n.value[1..]);
-                    if acc.len() > super::ble_receiver::MAX_WEAVE_MESSAGE {
-                        warn!(
-                            "{INNER_NAME}: Weave message from the peer passed {} B without ending; dropping it",
-                            super::ble_receiver::MAX_WEAVE_MESSAGE
-                        );
-                        acc.clear();
-                        continue;
-                    }
-                    if header & 0x04 == 0 {
-                        continue;
-                    }
-
-                    let msg = std::mem::take(&mut acc);
-                    if msg.len() <= 3 {
-                        continue;
-                    }
-                    // `00 00 00` is multiplex control, which the stack above
-                    // must not see. Anything else is the peer's service hash -
-                    // not always fc9f5e, and per-session.
-                    if msg[..3] == [0x00, 0x00, 0x00] {
-                        debug!(
-                            "{INNER_NAME}: multiplex control {:02x?}",
-                            &msg[..msg.len().min(24)]
-                        );
-                        // A response before any data is the phone refusing a
-                        // second session on a link that still holds the last
-                        // one. Nothing else comes, so end here: the send fails
-                        // now instead of hanging, and blocking every later send
-                        // to this phone. One after data is the phone closing a
-                        // session that worked, and changes nothing.
-                        if !heard_from_peer && multiplex_response_hash(&msg[3..]).is_some() {
-                            refused = true;
-                            break;
-                        }
-                        continue;
-                    }
-                    // Sanity-check the frame length that follows the service
-                    // hash before handing anything up.
-                    //
-                    // A reassembled message is [3-byte hash][4-byte length]
-                    // [frame]. If that length is not plausible then this is not
-                    // a data frame at all and forwarding it puts bytes into the
-                    // protobuf layer that were never a frame - which is how a
-                    // stray multiplex control frame surfaced far away as
-                    // "SecureMessage.header_and_body: invalid wire type: Varint",
-                    // 0x08 being the first byte of a control body rather than
-                    // the 0x0A that starts a SecureMessage. Report it here, with
-                    // the bytes, where it can still be identified.
-                    if msg.len() >= 7 {
-                        let len =
-                            u32::from_be_bytes([msg[3], msg[4], msg[5], msg[6]]) as usize;
-                        if len == 0 || len > SANE_FRAME_LENGTH || len > msg.len() - 7 {
-                            warn!(
-                                "{INNER_NAME}: inbound frame is not a data frame - declared \
-                                 length {len} against {} B of body; dropping. First bytes: \
-                                 {:02x?}",
-                                msg.len().saturating_sub(7),
-                                &msg[..msg.len().min(32)]
+                            // One log line per multiplex message actually emitted,
+                            // with the counter it goes out under and how many Weave
+                            // packets it will take.
+                            //
+                            // The peer discarded a frame with "invalid tag (zero)",
+                            // and the only zero bytes this side emits are the
+                            // four-byte length prefix - so at that moment the peer
+                            // was reading our prefix as frame content, four bytes
+                            // out of step. Whether that is one message emitted as
+                            // two, two merged into one, or a lost packet cannot be
+                            // told from the duplex side alone; this counts what
+                            // leaves, so it can be matched against what the peer
+                            // reads.
+                            trace!(
+                                "{INNER_NAME}: mux out: {} B total, declared len {len}, counter {}, \
+                                 {} packet(s), beginning {:02x?}",
+                                msg.len(),
+                                counter,
+                                msg.len().div_ceil(max_payload),
+                                &msg[..msg.len().min(16)]
                             );
+
+                            if let Err(e) = send_weave(
+                                &peripheral, &client_tx, &msg, &mut counter, max_payload,
+                            ).await {
+                                warn!("{INNER_NAME}: weave send failed: {e}");
+                                return;
+                            }
+                        }
+                    }
+
+                    // Inbound.
+                    note = notifications.next() => {
+                        let Some(n) = note else { break };
+                        if n.uuid != BLE_SOCKET_SERVER_TX_UUID || n.value.is_empty() {
                             continue;
                         }
-                    }
+                        let header = n.value[0];
 
-                    if hash != msg[..3] {
-                        let learned: [u8; 3] = [msg[0], msg[1], msg[2]];
-                        info!(
-                            "{INNER_NAME}: peer is using service hash {learned:02x?} \
-                             (was {hash:02x?})"
-                        );
-                        hash = learned;
-                    }
-                    heard_from_peer = true;
-                    if far_wr.write_all(&msg[3..]).await.is_err() {
-                        break;
-                    }
-                }
+                        // Check the counter before anything else: it is 3 bits, it
+                        // wraps, and control and data share one sequence per
+                        // direction - so a control packet consumes one too and
+                        // skipping it here would desynchronise the check itself.
+                        let got = (header >> 4) & 0x07;
+                        let expected = peer_counter;
+                        let lost = got != expected;
+                        // Resynchronise on what actually arrived, so one lost packet
+                        // costs one frame rather than every frame after it.
+                        peer_counter = (got + 1) & 0x07;
 
-                // The peer connected on the medium we offered. Hold it: it will
-                // not use the socket until the old channel is released.
-                Some(sock) = upgrade_rx.recv() => {
-                    info!("{INNER_NAME}: upgraded socket ready, holding for release");
-                    upgraded = Some(sock);
-                }
-
-                // The old channel has been released.
-                Some(_) = switch_rx.recv() => {
-                    match upgraded.take() {
-                        Some(mut sock) => {
-                            info!("{INNER_NAME}: switching the stream onto the upgraded socket");
-
-                            // Carry anything half-read across.
-                            //
-                            // `pending` holds bytes taken off the duplex that
-                            // have not yet formed a whole frame. Dropping them
-                            // here loses the middle of the stream: the peer sits
-                            // waiting for the rest of a frame that no longer
-                            // exists, which is a transfer that stalls partway
-                            // with the sender believing it sent everything.
-                            if !pending.is_empty() {
-                                info!(
-                                    "{INNER_NAME}: carrying {} B of partial frame onto the \
-                                     upgraded socket",
-                                    pending.len()
-                                );
-                                if let Err(e) = sock.write_all(&pending).await {
-                                    warn!("{INNER_NAME}: could not carry the partial frame: {e}");
-                                    return;
-                                }
-                                pending.clear();
+                        if header & 0x80 != 0 {
+                            // Weave has no graceful close, so a completed transfer
+                            // ends with an Error just as a failed one does.
+                            if header & 0x0f == 2 {
+                                info!("{INNER_NAME}: peer closed the Weave connection");
+                                break;
                             }
-
-                            // Close the multiplex *service channel*, and only
-                            // that. The GATT link stays up.
-                            //
-                            // The peer promotes its endpoint channel the moment
-                            // it reads CLIENT_INTRODUCTION, but its reader keeps
-                            // draining the old channel until that channel ends -
-                            // its log shows "replaced endpoint's channel from
-                            // ENCRYPTED_BLE to ENCRYPTED_WIFI_HOTSPOT", then
-                            // KEEP_ALIVE frames still arriving "on channel
-                            // ENCRYPTED_BLE" afterwards, and then nothing at all
-                            // once we splice: sixty seconds of silence and
-                            // "Time's up!" with bytesReceived stuck at the 98304
-                            // BLE had delivered. Leaving the channel open is
-                            // what strands it.
-                            //
-                            // An earlier attempt to close "BLE" dropped the GATT
-                            // connection outright, which tore down the peer's
-                            // Weave socket and failed the same way for the
-                            // opposite reason. The distinction matters: this
-                            // sends the multiplex DISCONNECT for our service and
-                            // nothing more. The frame is the one the peer itself
-                            // sends when it closes a service on us, observed as
-                            // 00 00 00 08 02 1a 05 0a 03 <hash> - control prefix,
-                            // command 2, then the service hash.
-                            let mut disconnect = vec![0x00, 0x00, 0x00, 0x08, 0x02, 0x1a, 0x05,
-                                                     0x0a, 0x03];
-                            disconnect.extend_from_slice(&hash);
-                            if let Err(e) = send_weave(
-                                &peripheral, &client_tx, &disconnect, &mut counter, max_payload,
-                            ).await {
-                                warn!("{INNER_NAME}: could not close the multiplex channel: {e}");
-                            } else {
-                                info!(
-                                    "{INNER_NAME}: closed the multiplex channel for {hash:02x?}; \
-                                     the GATT link stays up"
-                                );
-                            }
-
-                            // Rejoin the halves: TCP framing is exactly what is
-                            // already flowing, so nothing needs translating.
-                            let mut joined = tokio::io::join(far_rd, far_wr);
-
-                            // The splice is live from here. Release the sender,
-                            // which has been holding payload back precisely so
-                            // nothing was written to BLE after the peer stopped
-                            // reading it.
-                            pump_switched.notify_waiters();
-                            match tokio::io::copy_bidirectional(&mut sock, &mut joined).await {
-                                Ok((from_peer, to_peer)) => info!(
-                                    "{INNER_NAME}: upgraded socket closed \
-                                     ({from_peer} B in, {to_peer} B out)"
-                                ),
-                                Err(e) => warn!("{INNER_NAME}: upgraded socket failed: {e}"),
-                            }
-                            return;
+                            continue;
                         }
-                        None => warn!("{INNER_NAME}: asked to switch with no upgraded socket"),
+
+                        if lost {
+                            // Reassembling across a hole produces bytes that are not
+                            // a frame at all. Say so here, where it is a lost BLE
+                            // packet, instead of letting it become an unexplained
+                            // protobuf failure several layers up.
+                            warn!(
+                                "{INNER_NAME}: lost a Weave packet from the peer (expected counter \
+                                 {expected}, got {got}); dropping the partial frame"
+                            );
+                            acc.clear();
+                            continue;
+                        }
+
+                        if header & 0x08 != 0 {
+                            acc.clear();
+                        }
+                        acc.extend_from_slice(&n.value[1..]);
+                        if acc.len() > super::ble_receiver::MAX_WEAVE_MESSAGE {
+                            warn!(
+                                "{INNER_NAME}: Weave message from the peer passed {} B without ending; dropping it",
+                                super::ble_receiver::MAX_WEAVE_MESSAGE
+                            );
+                            acc.clear();
+                            continue;
+                        }
+                        if header & 0x04 == 0 {
+                            continue;
+                        }
+
+                        let msg = std::mem::take(&mut acc);
+                        if msg.len() <= 3 {
+                            continue;
+                        }
+                        // `00 00 00` is multiplex control, which the stack above
+                        // must not see. Anything else is the peer's service hash -
+                        // not always fc9f5e, and per-session.
+                        if msg[..3] == [0x00, 0x00, 0x00] {
+                            debug!(
+                                "{INNER_NAME}: multiplex control {:02x?}",
+                                &msg[..msg.len().min(24)]
+                            );
+                            // A response before any data is the phone refusing a
+                            // second session on a link that still holds the last
+                            // one. Nothing else comes, so end here: the send fails
+                            // now instead of hanging, and blocking every later send
+                            // to this phone. One after data is the phone closing a
+                            // session that worked, and changes nothing.
+                            if !heard_from_peer && multiplex_response_hash(&msg[3..]).is_some() {
+                                refused = true;
+                                break;
+                            }
+                            continue;
+                        }
+                        // Sanity-check the frame length that follows the service
+                        // hash before handing anything up.
+                        //
+                        // A reassembled message is [3-byte hash][4-byte length]
+                        // [frame]. If that length is not plausible then this is not
+                        // a data frame at all and forwarding it puts bytes into the
+                        // protobuf layer that were never a frame - which is how a
+                        // stray multiplex control frame surfaced far away as
+                        // "SecureMessage.header_and_body: invalid wire type: Varint",
+                        // 0x08 being the first byte of a control body rather than
+                        // the 0x0A that starts a SecureMessage. Report it here, with
+                        // the bytes, where it can still be identified.
+                        if msg.len() >= 7 {
+                            let len =
+                                u32::from_be_bytes([msg[3], msg[4], msg[5], msg[6]]) as usize;
+                            if len == 0 || len > SANE_FRAME_LENGTH || len > msg.len() - 7 {
+                                warn!(
+                                    "{INNER_NAME}: inbound frame is not a data frame - declared \
+                                     length {len} against {} B of body; dropping. First bytes: \
+                                     {:02x?}",
+                                    msg.len().saturating_sub(7),
+                                    &msg[..msg.len().min(32)]
+                                );
+                                continue;
+                            }
+                        }
+
+                        if hash != msg[..3] {
+                            let learned: [u8; 3] = [msg[0], msg[1], msg[2]];
+                            info!(
+                                "{INNER_NAME}: peer is using service hash {learned:02x?} \
+                                 (was {hash:02x?})"
+                            );
+                            hash = learned;
+                        }
+                        heard_from_peer = true;
+                        if far_wr.write_all(&msg[3..]).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    // The peer connected on the medium we offered. Hold it: it will
+                    // not use the socket until the old channel is released.
+                    Some(sock) = upgrade_rx.recv() => {
+                        info!("{INNER_NAME}: upgraded socket ready, holding for release");
+                        upgraded = Some(sock);
+                    }
+
+                    // The old channel has been released.
+                    Some(_) = switch_rx.recv() => {
+                        // The socket is sent before the switch is asked for, but
+                        // `select!` may pick the switch first when both are ready,
+                        // so take it from its channel here if it is waiting.
+                        match upgraded.take().or_else(|| upgrade_rx.try_recv().ok()) {
+                            Some(mut sock) => {
+                                info!("{INNER_NAME}: switching the stream onto the upgraded socket");
+
+                                // Carry anything half-read across.
+                                //
+                                // `pending` holds bytes taken off the duplex that
+                                // have not yet formed a whole frame. Dropping them
+                                // here loses the middle of the stream: the peer sits
+                                // waiting for the rest of a frame that no longer
+                                // exists, which is a transfer that stalls partway
+                                // with the sender believing it sent everything.
+                                if !pending.is_empty() {
+                                    info!(
+                                        "{INNER_NAME}: carrying {} B of partial frame onto the \
+                                         upgraded socket",
+                                        pending.len()
+                                    );
+                                    if let Err(e) = sock.write_all(&pending).await {
+                                        warn!("{INNER_NAME}: could not carry the partial frame: {e}");
+                                        return;
+                                    }
+                                    pending.clear();
+                                }
+
+                                // Close the multiplex *service channel*, and only
+                                // that. The GATT link stays up.
+                                //
+                                // The peer promotes its endpoint channel the moment
+                                // it reads CLIENT_INTRODUCTION, but its reader keeps
+                                // draining the old channel until that channel ends -
+                                // its log shows "replaced endpoint's channel from
+                                // ENCRYPTED_BLE to ENCRYPTED_WIFI_HOTSPOT", then
+                                // KEEP_ALIVE frames still arriving "on channel
+                                // ENCRYPTED_BLE" afterwards, and then nothing at all
+                                // once we splice: sixty seconds of silence and
+                                // "Time's up!" with bytesReceived stuck at the 98304
+                                // BLE had delivered. Leaving the channel open is
+                                // what strands it.
+                                //
+                                // An earlier attempt to close "BLE" dropped the GATT
+                                // connection outright, which tore down the peer's
+                                // Weave socket and failed the same way for the
+                                // opposite reason. The distinction matters: this
+                                // sends the multiplex DISCONNECT for our service and
+                                // nothing more. The frame is the one the peer itself
+                                // sends when it closes a service on us, observed as
+                                // 00 00 00 08 02 1a 05 0a 03 <hash> - control prefix,
+                                // command 2, then the service hash.
+                                let mut disconnect = vec![0x00, 0x00, 0x00, 0x08, 0x02, 0x1a, 0x05,
+                                                         0x0a, 0x03];
+                                disconnect.extend_from_slice(&hash);
+                                if let Err(e) = send_weave(
+                                    &peripheral, &client_tx, &disconnect, &mut counter, max_payload,
+                                ).await {
+                                    warn!("{INNER_NAME}: could not close the multiplex channel: {e}");
+                                } else {
+                                    info!(
+                                        "{INNER_NAME}: closed the multiplex channel for {hash:02x?}; \
+                                         the GATT link stays up"
+                                    );
+                                }
+
+                                // Rejoin the halves: TCP framing is exactly what is
+                                // already flowing, so nothing needs translating.
+                                let mut joined = tokio::io::join(far_rd, far_wr);
+
+                                // The splice is live from here. Release the sender,
+                                // which has been holding payload back precisely so
+                                // nothing was written to BLE after the peer stopped
+                                // reading it.
+                                pump_switched.notify_waiters();
+                                match tokio::io::copy_bidirectional(&mut sock, &mut joined).await {
+                                    Ok((from_peer, to_peer)) => info!(
+                                        "{INNER_NAME}: upgraded socket closed \
+                                         ({from_peer} B in, {to_peer} B out)"
+                                    ),
+                                    Err(e) => warn!("{INNER_NAME}: upgraded socket failed: {e}"),
+                                }
+                                return;
+                            }
+                            // Nothing to switch onto. The sender is waiting on
+                            // `switched`, which would never fire; ending the pump
+                            // ends its stream, so the transfer fails instead of
+                            // hanging.
+                            None => {
+                                warn!(
+                                    "{INNER_NAME}: asked to switch with no upgraded socket; ending the transfer"
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
             }
-        }
+        };
+        pump.await;
 
         // Let go of the peer.
         //
