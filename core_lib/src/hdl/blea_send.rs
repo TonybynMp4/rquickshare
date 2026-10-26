@@ -49,6 +49,28 @@ const MAX_PACKET_SIZE: u16 = 509;
 #[cfg(target_os = "windows")]
 const FALLBACK_PACKET_SIZE: u16 = 20;
 
+/// The salted service hash in a multiplex CONNECTION_RESPONSE, read from the
+/// control frame after its `00 00 00` prefix:
+/// `08 02` (CONNECTION_RESPONSE) `1a <len> { 0a 03 <hash> ... }`.
+///
+/// On a fresh link the phone sends none before its first data. It sends one
+/// first when the link still holds the previous session - Windows keeps a link
+/// up for a few seconds after we let go - and then refuses the new one: its log
+/// says "failed to create a new BLE ... socket for service ID hash [ 0xfc 0x9f
+/// 0x5e ] because there is already an active BLE socket under the same service
+/// ID", and nothing more ever comes.
+fn multiplex_response_hash(control: &[u8]) -> Option<[u8; 3]> {
+    if control.get(..3)? != [0x08, 0x02, 0x1a] {
+        return None;
+    }
+    let len = usize::from(*control.get(3)?);
+    let body = control.get(4..4 + len)?;
+    if body.get(..2)? != [0x0a, 0x03] {
+        return None;
+    }
+    body.get(2..5)?.try_into().ok()
+}
+
 /// The largest packet we can honestly say we are able to receive.
 ///
 /// Weave has each side state its maximum and the peer sends notifications up to
@@ -305,6 +327,9 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
         // that completes the handshake then closes without a word is
         // advertising Nearby presence but is not on the receiving screen.
         let mut heard_from_peer = false;
+        // The peer refused this session because the link still holds the last
+        // one; see `multiplex_response_hash`.
+        let mut refused = false;
 
         let mux = build_multiplex_connection_request();
         if let Err(e) = send_weave(&peripheral, &client_tx, &mux, &mut counter, max_payload).await {
@@ -461,6 +486,16 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
                             "{INNER_NAME}: multiplex control {:02x?}",
                             &msg[..msg.len().min(24)]
                         );
+                        // A response before any data is the phone refusing a
+                        // second session on a link that still holds the last
+                        // one. Nothing else comes, so end here: the send fails
+                        // now instead of hanging, and blocking every later send
+                        // to this phone. One after data is the phone closing a
+                        // session that worked, and changes nothing.
+                        if !heard_from_peer && multiplex_response_hash(&msg[3..]).is_some() {
+                            refused = true;
+                            break;
+                        }
                         continue;
                     }
                     // Sanity-check the frame length that follows the service
@@ -613,6 +648,11 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
 
         if heard_from_peer {
             info!("{INNER_NAME}: pump ended");
+        } else if refused {
+            warn!(
+                "{INNER_NAME}: peer refused the session: the link still holds the previous \
+                 one, which Windows drops a few seconds after a send ends; send again then"
+            );
         } else {
             warn!(
                 "{INNER_NAME}: peer accepted the Weave connection then closed it without a word - \
@@ -682,4 +722,36 @@ async fn send_weave(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_hash_a_multiplex_response_assigns() {
+        // Two responses a Pixel sent on retried links, after the 00 00 00.
+        let first = [0x08, 0x02, 0x1a, 0x05, 0x0a, 0x03, 0x1d, 0xf2, 0x54];
+        let second = [0x08, 0x02, 0x1a, 0x05, 0x0a, 0x03, 0x64, 0x1b, 0x45];
+        assert_eq!(multiplex_response_hash(&first), Some([0x1d, 0xf2, 0x54]));
+        assert_eq!(multiplex_response_hash(&second), Some([0x64, 0x1b, 0x45]));
+    }
+
+    #[test]
+    fn ignores_other_control_frames_and_short_ones() {
+        // Our own ConnectionRequest is control type 1, not a response.
+        assert_eq!(
+            multiplex_response_hash(&build_multiplex_connection_request()[3..]),
+            None
+        );
+        let response = [0x08, 0x02, 0x1a, 0x05, 0x0a, 0x03, 0x1d, 0xf2, 0x54];
+        for n in 0..response.len() {
+            assert_eq!(multiplex_response_hash(&response[..n]), None);
+        }
+        // A body that claims more than is there.
+        assert_eq!(
+            multiplex_response_hash(&[0x08, 0x02, 0x1a, 0x7f, 0x0a, 0x03, 0x1d]),
+            None
+        );
+    }
 }
