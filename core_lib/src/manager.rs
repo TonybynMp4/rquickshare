@@ -333,7 +333,7 @@ impl TcpServer {
             let _adv = crate::hdl::AdvertisePause::new();
 
             let address = address.to_string();
-            let channel = crate::hdl::open_ble_by_address(&address).await?;
+            let channel = crate::hdl::open_ble_by_address(&address, &ctk).await?;
 
             // Stop BLE scanning now that we are connected - not before. A scan
             // and a connection share the radio, and scanning through a transfer
