@@ -57,6 +57,11 @@ const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 /// finishing the last file, and Windows Quick Share then reports "Can't complete
 /// transfer" for a transfer that arrived intact. We only send it ourselves if
 /// the peer has not closed within this long.
+///
+/// This bound stands in for the confirmation a receiver that lost the data
+/// never sends: the hang-up is the event, and this is how a send it never
+/// comes for ends as Disconnected instead of staying open and blocking every
+/// later send to that peer. Phones hang up within a second of the last byte.
 const PEER_HANG_UP_GRACE: Duration = Duration::from_secs(15);
 
 /// Whether to pursue the send-side WiFi upgrade: joining the hotspot the phone
@@ -130,13 +135,11 @@ async fn introduce_over_upgraded_socket(
     socket.flush().await?;
     info!("Bandwidth upgrade: sent CLIENT_INTRODUCTION");
 
+    // No timeout: this runs in the upgrade task, which ends when the transfer
+    // does, and a peer that closes the socket ends the read. The transfer
+    // carries on over BLE meanwhile.
     let mut len_buf = [0u8; 4];
-    tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        socket.read_exact(&mut len_buf),
-    )
-    .await
-    .map_err(|_| anyhow!("timed out waiting for CLIENT_INTRODUCTION_ACK"))??;
+    socket.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 || len > SANE_FRAME_LENGTH as usize {
         return Err(anyhow!("insane ack frame length {len}"));
@@ -2151,34 +2154,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 // peer's subnet before connecting, or the connect has no route
                 // and hangs.
                 if let Ok(gw) = gateway.parse::<std::net::Ipv4Addr>() {
-                    if crate::hdl::wait_for_route(gw, std::time::Duration::from_secs(30)).await {
+                    if crate::hdl::wait_for_route(gw).await {
                         info!("Bandwidth upgrade: hold an address on the peer's subnet");
                     } else {
                         warn!("Bandwidth upgrade: no address on the peer's subnet; trying anyway");
                     }
                 }
 
-                // The AP can accept the association a beat before its listener
-                // is up, so a single refused connect isn't conclusive.
-                let socket = {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-                    loop {
-                        let why = match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            tokio::net::TcpStream::connect(format!("{gateway}:{port}")),
-                        )
-                        .await
-                        {
-                            Ok(Ok(s)) => break s,
-                            Ok(Err(e)) => e.to_string(),
-                            Err(_) => "connect timed out".to_string(),
-                        };
-                        if std::time::Instant::now() >= deadline {
-                            return Err(anyhow!("could not reach {gateway}:{port}: {why}"));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    }
-                };
+                // One connect. The phone offers its network only once it is
+                // listening on it, and this runs once we hold an address there.
+                // It used to retry every 500 ms for 20 s, each try capped at
+                // 5 s. A failure leaves the transfer on BLE.
+                let socket = tokio::net::TcpStream::connect(format!("{gateway}:{port}"))
+                    .await
+                    .map_err(|e| anyhow!("could not reach {gateway}:{port}: {e}"))?;
 
                 introduce_over_upgraded_socket(socket, endpoint_id, unencrypted, upgrade_tx).await
             };
@@ -2228,32 +2217,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         self.join_handle = Some(tokio::spawn(async move {
             let run = async {
                 info!("Bandwidth upgrade: connecting to the peer's LAN socket {ip}:{port} (background)");
-                // The peer logs "Successfully started listening for incoming Wifi
-                // Lan connections" before it offers, so the listener is normally
-                // already up - but a single refused connect right at the edge of
-                // that isn't conclusive, so retry briefly. A connect that never
-                // lands leaves `join_ready` false and the transfer finishes over
-                // BLE, exactly as a failed AP join does.
+                // One connect. The peer logs "Successfully started listening
+                // for incoming Wifi Lan connections" before it offers, so the
+                // listener is up. It used to retry every 300 ms for 10 s. A
+                // connect that fails leaves `join_ready` false and the transfer
+                // finishes over BLE, exactly as a failed AP join does.
                 let addr = std::net::SocketAddr::from((ip, port));
-                let socket = {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                    loop {
-                        let why = match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            tokio::net::TcpStream::connect(addr),
-                        )
-                        .await
-                        {
-                            Ok(Ok(s)) => break s,
-                            Ok(Err(e)) => e.to_string(),
-                            Err(_) => "connect timed out".to_string(),
-                        };
-                        if std::time::Instant::now() >= deadline {
-                            return Err(anyhow!("could not reach {ip}:{port}: {why}"));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    }
-                };
+                let socket = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .map_err(|e| anyhow!("could not reach {ip}:{port}: {e}"))?;
 
                 introduce_over_upgraded_socket(socket, endpoint_id, unencrypted, upgrade_tx).await
             };
