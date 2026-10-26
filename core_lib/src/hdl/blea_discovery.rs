@@ -368,8 +368,9 @@ fn list_peer(
     peripheral: &btleplug::platform::Peripheral,
 ) {
     // Already reachable over the network - don't offer a second, far slower way
-    // to reach the same phone.
-    if known_on_lan(&name) {
+    // to reach the same phone. `RQS_LIST_BLE_ON_LAN` lists it anyway, so the
+    // BLE-initiated send can be tested with a phone that stays on the LAN.
+    if known_on_lan(&name) && std::env::var_os("RQS_LIST_BLE_ON_LAN").is_none() {
         debug!("{INNER_NAME}: {name} is already on the LAN, not listing it over BLE");
         return;
     }
