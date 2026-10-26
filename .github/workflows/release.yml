@@ -117,7 +117,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: app/main/pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # No rust-cache. The version stamp rebuilds our crates anyway, and a
+      # release's cache was always evicted before the next release (the repo
+      # sits at GitHub's 10 GB cache limit), so saving one cost time and pushed
+      # out the caches Build and Check do reuse.
+
       # protoc for prost-build. A composite action (no Node runtime):
       # arduino/setup-protoc is still on the deprecated Node 20.
       - uses: taiki-e/install-action@v2

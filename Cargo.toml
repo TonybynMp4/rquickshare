@@ -14,6 +14,10 @@ version = "1.0.0"
 
 # Profiles must live at the workspace root (per-crate profiles are ignored).
 [profile.release]
-lto = true
+# Thin LTO with the default 16 codegen units, not fat LTO with one. A release
+# always compiles from scratch, and fat LTO's single-threaded final step was
+# over half of it: ~4 of ~7.5 minutes per OS in CI. A cold local build went
+# from 207 s to 118 s. The exe grows about 3 MB (15.5 to 18.9 MB on Windows);
+# transfers are bound by the network and Bluetooth, not the CPU.
+lto = "thin"
 opt-level = 3
-codegen-units = 1
