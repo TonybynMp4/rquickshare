@@ -415,6 +415,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         Ok(())
     }
 
+    /// Whether `msg` is the user pressing Cancel on this transfer.
+    fn is_cancel_for_us(&self, msg: &ChannelMessage) -> bool {
+        msg.direction == ChannelDirection::FrontToLib
+            && msg.id == self.state.id
+            && msg.action == Some(ChannelAction::CancelTransfer)
+    }
+
+    /// Cancel at the user's request: report it, hang up and undo any upgrade.
+    /// Always ends the transfer, quietly unless hanging up fails.
+    async fn cancel_by_user(&mut self) -> Result<(), anyhow::Error> {
+        info!("Cancelling the transfer at the user's request");
+        self.update_state(
+            |e| {
+                e.state = State::Cancelled;
+            },
+            true,
+        )
+        .await;
+        self.disconnection().await?;
+        #[cfg(all(feature = "experimental", target_os = "windows"))]
+        self.cleanup_upgrade().await;
+        Err(anyhow!(crate::errors::AppError::NotAnError))
+    }
+
     /// Handle any frame already waiting, without blocking.
     ///
     /// Called between file chunks. The send loop writes continuously and never
@@ -431,24 +455,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         // cancel button did nothing for minutes. Three presses were logged
         // against a transfer that was already wedged, with no effect.
         while let Ok(channel_msg) = self.receiver.try_recv() {
-            if channel_msg.direction == ChannelDirection::LibToFront
-                || channel_msg.id != self.state.id
-            {
-                continue;
-            }
-            if let Some(ChannelAction::CancelTransfer) = channel_msg.action {
-                info!("Cancelling the transfer at the user's request");
-                self.update_state(
-                    |e| {
-                        e.state = State::Cancelled;
-                    },
-                    true,
-                )
-                .await;
-                self.disconnection().await?;
-                #[cfg(all(feature = "experimental", target_os = "windows"))]
-                self.cleanup_upgrade().await;
-                return Err(anyhow!(crate::errors::AppError::NotAnError));
+            if self.is_cancel_for_us(&channel_msg) {
+                return self.cancel_by_user().await;
             }
         }
 
@@ -479,13 +487,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
     /// and spinning on `try_recv` would burn a core waiting for it. Frames are
     /// fed by a background reader task, so awaiting here does not stop them
     /// arriving.
+    ///
+    /// Cancel is watched too: this wait can last as long as the peer takes to
+    /// release the old channel, and the Cancel button used to do nothing for
+    /// all of it.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     async fn await_next_frame(&mut self) -> Result<(), anyhow::Error> {
-        match self.frames.recv().await {
-            Some(frame_data) => Box::pin(self.handle_frame(frame_data)).await,
-            None => Err(anyhow!(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof
-            ))),
+        loop {
+            // Both branches are channel receives, so both are cancel-safe.
+            tokio::select! {
+                frame = self.frames.recv() => {
+                    return match frame {
+                        Some(frame_data) => Box::pin(self.handle_frame(frame_data)).await,
+                        None => Err(anyhow!(std::io::Error::from(
+                            std::io::ErrorKind::UnexpectedEof
+                        ))),
+                    };
+                }
+                msg = self.receiver.recv() => match msg {
+                    Ok(msg) if self.is_cancel_for_us(&msg) => return self.cancel_by_user().await,
+                    // Anything else, including having fallen behind on the
+                    // bus, leaves us waiting for the frame.
+                    _ => {}
+                },
+            }
         }
     }
 
@@ -1047,7 +1072,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                         if self.switch_tx.is_some()
                             && self.join_ready.load(std::sync::atomic::Ordering::Relaxed)
                         {
-                            self.switch_to_upgraded_medium().await;
+                            self.switch_to_upgraded_medium().await?;
                         } else {
                             warn!(
                                 "Bandwidth upgrade: peer released the prior channel before the \
@@ -1076,7 +1101,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     // late answer cannot splice a stream that has moved on.
                     if is_safe_to_close && !self.upgraded && self.switch_tx.is_some() {
                         info!("Bandwidth upgrade: peer released the prior channel; switching");
-                        self.switch_to_upgraded_medium().await;
+                        self.switch_to_upgraded_medium().await?;
                     }
                 }
             }
@@ -2147,7 +2172,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
     /// Called when the peer answers SAFE_TO_CLOSE_PRIOR_CHANNEL - the point at
     /// which both sides have agreed the old channel is drained.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
-    async fn switch_to_upgraded_medium(&mut self) {
+    async fn switch_to_upgraded_medium(&mut self) -> Result<(), anyhow::Error> {
         // Register for the confirmation *before* asking, so the splice cannot
         // complete in the gap and leave us waiting for a signal already sent.
         let confirmed = self.switched.clone();
@@ -2175,8 +2200,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         // Nothing can hang here indefinitely. Every Weave write is bounded, so a
         // dead link ends the pump, which drops the duplex and fails this
         // transfer with a real error rather than a silent corruption.
-        if let Some(w) = wait.as_pin_mut() {
-            w.await;
+        //
+        // Cancel is the one thing that ends the wait early: the user pressing it
+        // during the switch used to be ignored until the splice finished.
+        if let Some(mut w) = wait.as_pin_mut() {
+            loop {
+                tokio::select! {
+                    _ = &mut w => break,
+                    msg = self.receiver.recv() => match msg {
+                        Ok(msg) if self.is_cancel_for_us(&msg) => return self.cancel_by_user().await,
+                        _ => {}
+                    },
+                }
+            }
         }
 
         self.upgraded = true;
@@ -2187,6 +2223,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         // of link speed. A 512 KB chunk amortises that overhead ~16x.
         self.chunk_size = 512 * 1024;
         info!("Bandwidth upgrade: switched to the new medium; raising chunk size");
+        Ok(())
     }
 
     /// Tell the peer which upgrade mediums we support.
@@ -2370,5 +2407,53 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         // which tokio rounds up to a whole millisecond per update; yielding
         // hands the turn over without a timer.
         tokio::task::yield_now().await;
+    }
+}
+
+#[cfg(all(test, feature = "experimental", target_os = "windows"))]
+mod tests {
+    use super::*;
+    use crate::utils::DeviceType;
+
+    /// Waiting for the peer to release the old channel used to ignore Cancel
+    /// until a frame arrived. With no frame coming at all, Cancel has to end
+    /// the wait on its own.
+    #[tokio::test]
+    async fn cancel_ends_the_wait_for_the_medium_switch() {
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let ui = tokio::sync::broadcast::channel(16).0;
+        let mut or = OutboundRequest::new(
+            *b"abcd",
+            ours,
+            "send-1".to_owned(),
+            ui.clone(),
+            OutboundPayload::Text("hello".to_owned()),
+            RemoteDeviceInfo {
+                name: "peer".to_owned(),
+                device_type: DeviceType::Laptop,
+            },
+        );
+
+        // Someone else's cancel must not stop this transfer.
+        let cancel = |id: &str| ChannelMessage {
+            id: id.to_owned(),
+            direction: ChannelDirection::FrontToLib,
+            action: Some(ChannelAction::CancelTransfer),
+            ..Default::default()
+        };
+        ui.send(cancel("send-2")).unwrap();
+        ui.send(cancel("send-1")).unwrap();
+
+        // The timeout only turns a hang into a failure.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), or.await_next_frame())
+            .await
+            .expect("Cancel did not end the wait");
+        let err = ended.expect_err("the wait should end the transfer");
+        assert!(matches!(
+            err.downcast_ref(),
+            Some(crate::errors::AppError::NotAnError)
+        ));
+        assert_eq!(or.state.state, State::Cancelled);
+        drop(theirs);
     }
 }
