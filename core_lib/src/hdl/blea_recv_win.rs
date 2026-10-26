@@ -1338,7 +1338,9 @@ impl BleReceiverAdvertiser {
                 let want_paused = sending || (hidden && !subscribed);
                 if want_paused != adv_paused {
                     if want_paused {
-                        let _ = provider.StopAdvertising();
+                        if let Err(e) = provider.StopAdvertising() {
+                            warn!("{INNER_NAME}: could not pause the advertisement: {e}");
+                        }
                         if sending {
                             info!("{INNER_NAME}: BLE send in progress, pausing the advertisement");
                         } else {
@@ -1390,7 +1392,9 @@ impl BleReceiverAdvertiser {
                              keeping the advertisement up so the phone keeps listing us"
                         );
                     } else {
-                        let _ = provider.StopAdvertising();
+                        if let Err(e) = provider.StopAdvertising() {
+                            warn!("{INNER_NAME}: could not stop advertising to recycle: {e}");
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         match provider.StartAdvertisingWithParameters(&params) {
                             Ok(()) => {
@@ -1430,7 +1434,9 @@ impl BleReceiverAdvertiser {
             }
 
             info!("{INNER_NAME}: tracker cancelled, stopping advertiser");
-            let _ = provider.StopAdvertising();
+            if let Err(e) = provider.StopAdvertising() {
+                warn!("{INNER_NAME}: could not stop advertising: {e}");
+            }
             Ok(())
         })
         .await??;
