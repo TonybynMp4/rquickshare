@@ -167,7 +167,13 @@ fn find_characteristic(peripheral: &Peripheral, uuid: Uuid) -> Option<Characteri
 /// rotate, so re-finding one by address is unreliable by design, and a second
 /// concurrent scan on a fresh adapter does not reliably repopulate
 /// `peripherals()` - every attempt failed with "no longer advertising".
-pub async fn open_ble_by_address(address: &str) -> Result<BleChannel, anyhow::Error> {
+///
+/// Ends early when `cancel` fires, so shutting down mid-connect doesn't wait
+/// out the connect and its refresh.
+pub async fn open_ble_by_address(
+    address: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<BleChannel, anyhow::Error> {
     let peripheral = super::discovered_peripheral(address).ok_or_else(|| {
         anyhow::anyhow!(
             "BLE peer {address} was not found by discovery this session; rescan and try again"
@@ -181,15 +187,21 @@ pub async fn open_ble_by_address(address: &str) -> Result<BleChannel, anyhow::Er
     // though the peer is present and healthy. Discovery only refreshes while it
     // is running, which it is not once the user has stopped scanning - so a send
     // shortly after a scan works and one a few minutes later does not.
-    match open(peripheral).await {
-        Ok(channel) => Ok(channel),
-        Err(first) => {
-            warn!("{INNER_NAME}: {first}; the handle may have gone stale, rescanning");
-            let fresh = super::refresh_peripheral(address)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("{first}"))?;
-            open(fresh).await
+    let attempt = async {
+        match open(peripheral).await {
+            Ok(channel) => Ok(channel),
+            Err(first) => {
+                warn!("{INNER_NAME}: {first}; the handle may have gone stale, rescanning");
+                let fresh = super::refresh_peripheral(address)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("{first}"))?;
+                open(fresh).await
+            }
         }
+    };
+    tokio::select! {
+        r = attempt => r,
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("cancelled while connecting to {address}")),
     }
 }
 
@@ -250,6 +262,8 @@ pub async fn open(peripheral: Peripheral) -> Result<BleChannel, anyhow::Error> {
         .await?;
     info!("{INNER_NAME}: sent Weave ConnectionRequest");
 
+    // Bounded: the bound stands in for a peer that took the GATT connection and
+    // the subscribe but never answers Weave, which nothing reports.
     let packet_size = loop {
         let n = tokio::time::timeout(std::time::Duration::from_secs(10), notifications.next())
             .await
@@ -706,7 +720,9 @@ async fn send_weave(
         // the peer's ATT acknowledgement is the only real backpressure here.
         //
         // Bounded, because a write to a peer that has gone away otherwise waits
-        // forever - which turned a dead link into a hung transfer.
+        // forever - which turned a dead link into a hung transfer. The bound
+        // stands in for the link-loss event, which the stack does not deliver
+        // to a write already waiting.
         match tokio::time::timeout(
             std::time::Duration::from_secs(20),
             peripheral.write(characteristic, &pkt, WriteType::WithResponse),

@@ -107,50 +107,77 @@ fn name_for_address(address: &str) -> Option<String> {
 /// Matching is by *name*, because that is the only stable identity here - the
 /// address we were given is by definition the one that expired.
 pub async fn refresh_peripheral(address: &str) -> Option<btleplug::platform::Peripheral> {
-    use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
-    use btleplug::platform::Manager;
-
     let wanted = name_for_address(address)?;
     info!("{INNER_NAME}: refreshing a stale handle for {wanted}");
 
     let manager = Manager::new().await.ok()?;
     let adapter = manager.adapters().await.ok()?.into_iter().next()?;
-    adapter.start_scan(ScanFilter::default()).await.ok()?;
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    let mut found = None;
-    while std::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        let Ok(peripherals) = adapter.peripherals().await else {
-            continue;
-        };
-        for p in peripherals {
-            let Ok(Some(props)) = p.properties().await else {
-                continue;
-            };
-            if !props.services.contains(&SERVICE_UUID_COPRESENCE) {
-                continue;
-            }
-            // Confirm it is the same device by reading its advertisement, the
-            // same way discovery identifies peers in the first place.
-            if let Some((name, _)) = read_peer_advertisement(&p).await {
-                if name == wanted {
-                    let addr = p.address().to_string();
-                    remember_peer(&name, &addr, &p);
-                    info!("{INNER_NAME}: {wanted} is now at {addr}");
-                    found = Some(p);
-                    break;
-                }
-            }
-        }
-        if found.is_some() {
-            break;
-        }
+    // Subscribed before the scan starts, so its first advertisements are seen.
+    let mut events = adapter.events().await.ok()?;
+    if let Err(e) = adapter.start_scan(ScanFilter::default()).await {
+        warn!("{INNER_NAME}: could not scan to refresh {wanted}: {e}");
+        return None;
     }
 
-    let _ = adapter.stop_scan().await;
-    if found.is_none() {
-        warn!("{INNER_NAME}: could not find {wanted} again; it may be out of range");
+    // Driven by advertisements as they arrive; this used to poll
+    // `peripherals()` every 400 ms. Each advertiser is identified the way
+    // discovery does it: by the name in its 0xFEF3 service data when the
+    // advertisement carries one, and over GATT only for the fast form, which
+    // has none. The old refresh only ever read GATT, which never found a phone
+    // that puts its full advertisement in the service data. One that could not
+    // be read gets another go on its next advertisement.
+    let search = async {
+        let mut identified = std::collections::HashSet::new();
+        while let Some(event) = events.next().await {
+            let CentralEvent::ServiceDataAdvertisement { id, service_data } = event else {
+                continue;
+            };
+            let Some(data) = service_data.get(&SERVICE_UUID_COPRESENCE) else {
+                continue;
+            };
+            if identified.contains(&id) {
+                continue;
+            }
+            let Some(advertised) = super::parse_peer_advertisement(data) else {
+                // Some other use of the copresence service.
+                identified.insert(id);
+                continue;
+            };
+            let Ok(p) = adapter.peripheral(&id).await else {
+                continue;
+            };
+            let name = match advertised.name {
+                Some(name) => name,
+                None => match read_peer_advertisement(&p).await {
+                    Some((name, _)) => name,
+                    None => continue,
+                },
+            };
+            identified.insert(id);
+            if name == wanted {
+                return Some(p);
+            }
+        }
+        None
+    };
+    // The bound stands in for the phone having gone out of range, which no
+    // event reports: without it a send to a phone that left would sit in
+    // "Connecting..." for good.
+    let found = tokio::time::timeout(std::time::Duration::from_secs(8), search)
+        .await
+        .ok()
+        .flatten();
+
+    if let Err(e) = adapter.stop_scan().await {
+        debug!("{INNER_NAME}: could not stop the refresh scan: {e}");
+    }
+    match &found {
+        Some(p) => {
+            let addr = p.address().to_string();
+            remember_peer(&wanted, &addr, p);
+            info!("{INNER_NAME}: {wanted} is now at {addr}");
+        }
+        None => warn!("{INNER_NAME}: could not find {wanted} again; it may be out of range"),
     }
     found
 }
@@ -166,7 +193,9 @@ const ADV_SLOT0_UUID: Uuid = uuid::uuid!("00000000-0000-3000-8000-000000000000")
 ///
 /// The connection is dropped afterwards: the send path reconnects when the user
 /// actually picks this target. Bounded, because a device that accepts a
-/// connection and then never answers would otherwise stall discovery.
+/// connection and then never answers would otherwise stall discovery; the bound
+/// stands in for that answer, which a silent device never sends and no event
+/// marks as missing.
 async fn read_peer_advertisement(
     peripheral: &btleplug::platform::Peripheral,
 ) -> Option<(String, u8)> {
