@@ -145,6 +145,27 @@ pub struct InboundRequest<S> {
         any(target_os = "linux", target_os = "windows")
     ))]
     upgrade_listener_started: bool,
+    /// The endpoint id the peer gave in its ConnectionRequest. Whoever connects
+    /// to the upgrade listener has to introduce itself with this id.
+    #[cfg(all(
+        feature = "experimental",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    peer_endpoint_id: Option<String>,
+    /// Cancelled when this request is dropped (see `_upgrade_session_guard`),
+    /// which ends any upgrade listener it started: the transfer it was for is
+    /// over.
+    #[cfg(all(
+        feature = "experimental",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    upgrade_session: tokio_util::sync::CancellationToken,
+    /// Held only for its Drop, which cancels `upgrade_session`.
+    #[cfg(all(
+        feature = "experimental",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    _upgrade_session_guard: tokio_util::sync::DropGuard,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
@@ -154,6 +175,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         // raced against the channel in `select!` loses bytes when cancelled.
         let (reader, writer) = tokio::io::split(socket);
         let frames = crate::hdl::spawn_frame_reader(reader, SANE_FRAME_LENGTH as usize);
+        #[cfg(all(
+            feature = "experimental",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        let upgrade_session = tokio_util::sync::CancellationToken::new();
 
         Self {
             socket: writer,
@@ -197,6 +223,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                 any(target_os = "linux", target_os = "windows")
             ))]
             upgrade_listener_started: false,
+            #[cfg(all(
+                feature = "experimental",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            peer_endpoint_id: None,
+            #[cfg(all(
+                feature = "experimental",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            upgrade_session: upgrade_session.clone(),
+            #[cfg(all(
+                feature = "experimental",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            _upgrade_session_guard: upgrade_session.drop_guard(),
         }
     }
 
@@ -373,6 +414,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             .connection_request
             .as_ref()
             .ok_or_else(|| anyhow!("Missing required fields"))?;
+        #[cfg(all(
+            feature = "experimental",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        {
+            self.peer_endpoint_id = connection_request.endpoint_id.clone();
+        }
 
         // Per grishka's PROTOCOL.md the client states the mediums it will accept
         // here, and the server is meant to intersect them with its own. If this
@@ -738,23 +786,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         // arrives from the P2P subnet - anything from the LAN subnet (192.168.1.x)
         // is the phone still talking over WiFi-LAN and is *not* evidence the
         // upgrade worked.
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
-                Ok(l) => {
-                    info!("Bandwidth upgrade: listening on 0.0.0.0:{port}");
-                    match l.accept().await {
-                        Ok((s, addr)) => {
-                            info!("*** Bandwidth upgrade: phone connected from {addr} ***");
-                            if let Err(e) = introduce_upgraded_channel(s).await {
-                                warn!("Bandwidth upgrade: introduction failed: {e}");
-                            }
-                        }
-                        Err(e) => warn!("Bandwidth upgrade: accept failed: {e}"),
-                    }
-                }
-                Err(e) => warn!("Bandwidth upgrade: bind failed: {e}"),
-            }
-        });
+        self.spawn_upgrade_listener(port);
 
         Ok(())
     }
@@ -977,9 +1009,38 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
     )))]
     async fn offer_upgrade_paths(&mut self) {}
 
+    /// Bind 0.0.0.0:`port` and serve it with `serve_upgrade_listener` for as
+    /// long as this transfer lasts. Shared by the hotspot, WIFI_LAN and WiFi
+    /// Direct offers - only the medium and credentials differ, never what
+    /// happens once the peer connects.
+    #[cfg(all(
+        feature = "experimental",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn spawn_upgrade_listener(&self, port: u16) {
+        let upgrade_tx = self.upgrade_tx.clone();
+        let expected = self.peer_endpoint_id.clone();
+        let session = self.upgrade_session.clone();
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
+                Ok(listener) => {
+                    info!("Bandwidth upgrade: listening on 0.0.0.0:{port}");
+                    serve_upgrade_listener(listener, expected, upgrade_tx, session).await;
+                }
+                // AddrInUse means a listener is still up for another transfer.
+                // This one still works - it just stays on the prior channel -
+                // so say which it is rather than failing opaquely.
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => warn!(
+                    "Bandwidth upgrade: port {port} is held by another transfer; staying on the \
+                     prior channel"
+                ),
+                Err(e) => warn!("Bandwidth upgrade: bind failed: {e}"),
+            }
+        });
+    }
+
     /// Accept the upgraded channel on `port`, introduce it, and hand it to the
-    /// bridge. Shared by the hotspot and WIFI_LAN offers - only the medium and
-    /// credentials differ, never what happens once the peer connects.
+    /// bridge.
     #[cfg(all(
         feature = "experimental",
         any(target_os = "linux", target_os = "windows")
@@ -993,55 +1054,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         }
         self.upgrade_listener_started = true;
 
-        let upgrade_tx = self.upgrade_tx.clone();
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
-                Ok(l) => {
-                    info!("Bandwidth upgrade: listening on 0.0.0.0:{port}");
-                    let accepted =
-                        match tokio::time::timeout(std::time::Duration::from_secs(45), l.accept())
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => {
-                                warn!(
-                                "Bandwidth upgrade: no peer connected within 45s; staying on the \
-                                 prior channel"
-                            );
-                                return;
-                            }
-                        };
-                    match accepted {
-                        Ok((s, addr)) => {
-                            info!("*** Bandwidth upgrade: phone connected from {addr} ***");
-                            match introduce_upgraded_channel(s).await {
-                                Ok(sock) => match &upgrade_tx {
-                                    Some(tx) => {
-                                        if tx.send(sock).is_err() {
-                                            warn!(
-                                                "Bandwidth upgrade: nothing left to hand the \
-                                                 upgraded socket to"
-                                            );
-                                        }
-                                    }
-                                    None => warn!(
-                                        "Bandwidth upgrade: introduced, but this transport cannot \
-                                         adopt the upgraded socket"
-                                    ),
-                                },
-                                Err(e) => warn!("Bandwidth upgrade: introduction failed: {e}"),
-                            }
-                        }
-                        Err(e) => warn!("Bandwidth upgrade: accept failed: {e}"),
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => warn!(
-                    "Bandwidth upgrade: port {port} still held by a previous transfer; staying on \
-                     the prior channel"
-                ),
-                Err(e) => warn!("Bandwidth upgrade: bind failed: {e}"),
-            }
-        });
+        self.spawn_upgrade_listener(port);
     }
 
     /// Bring up the Windows soft-AP and start accepting the upgraded channel,
@@ -1114,68 +1127,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         }
         self.upgrade_listener_started = true;
 
-        let upgrade_tx = self.upgrade_tx.clone();
-        tokio::spawn(async move {
-            match tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await {
-                Ok(l) => {
-                    info!("Bandwidth upgrade: listening on 0.0.0.0:{port}");
-                    // Bounded. The phone joined in ~5s in every successful run,
-                    // and it abandons the upgrade after ~68s anyway. An
-                    // unbounded accept leaks this task for the life of the
-                    // process and holds port 8899, so one phone that never
-                    // joined would break every subsequent transfer's upgrade.
-                    let accepted =
-                        match tokio::time::timeout(std::time::Duration::from_secs(45), l.accept())
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => {
-                                warn!(
-                                    "Bandwidth upgrade: no peer joined the hotspot within 45s; \
-                                     staying on the prior channel"
-                                );
-                                return;
-                            }
-                        };
-                    match accepted {
-                        Ok((s, addr)) => {
-                            info!("*** Bandwidth upgrade: phone connected from {addr} ***");
-                            match introduce_upgraded_channel(s).await {
-                                Ok(sock) => match &upgrade_tx {
-                                    Some(tx) => {
-                                        if tx.send(sock).is_err() {
-                                            warn!(
-                                                "Bandwidth upgrade: nothing left to hand the \
-                                                 upgraded socket to"
-                                            );
-                                        }
-                                    }
-                                    // The upgrade completed but no transport can
-                                    // adopt it, so the payload would arrive on a
-                                    // socket nobody reads. Say so rather than
-                                    // dropping it silently.
-                                    None => warn!(
-                                        "Bandwidth upgrade: introduced, but this transport \
-                                         cannot adopt the upgraded socket"
-                                    ),
-                                },
-                                Err(e) => warn!("Bandwidth upgrade: introduction failed: {e}"),
-                            }
-                        }
-                        Err(e) => warn!("Bandwidth upgrade: accept failed: {e}"),
-                    }
-                }
-                // AddrInUse here means a previous transfer's listener is still
-                // holding the port. The transfer still works - it just stays on
-                // the prior channel - so say which it is rather than failing
-                // opaquely.
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => warn!(
-                    "Bandwidth upgrade: port {port} still held by a previous transfer; \
-                     staying on the prior channel"
-                ),
-                Err(e) => warn!("Bandwidth upgrade: bind failed: {e}"),
-            }
-        });
+        self.spawn_upgrade_listener(port);
 
         Ok(())
     }
@@ -2589,6 +2541,68 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
     }
 }
 
+/// Accept connections on the upgrade listener until one introduces itself as
+/// `expected_endpoint_id`, hand that socket to `upgrade_tx`, and stop.
+///
+/// Anyone on the network can connect, so a connection that sends the wrong
+/// introduction, or nothing at all, must neither win nor hold the listener up:
+/// each one is introduced in its own task while accepting carries on. The
+/// whole thing ends with `session`, cancelled when the transfer is dropped -
+/// not on a timer - and dropping the task set abandons any connection still
+/// being introduced.
+#[cfg(all(
+    feature = "experimental",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(crate) async fn serve_upgrade_listener(
+    listener: tokio::net::TcpListener,
+    expected_endpoint_id: Option<String>,
+    upgrade_tx: Option<tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>>,
+    session: tokio_util::sync::CancellationToken,
+) {
+    let mut introducing = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = session.cancelled() => {
+                debug!("Bandwidth upgrade: transfer ended, closing the upgrade listener");
+                return;
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((socket, addr)) => {
+                    info!("*** Bandwidth upgrade: connection from {addr} ***");
+                    let expected = expected_endpoint_id.clone();
+                    introducing.spawn(async move {
+                        introduce_upgraded_channel(socket, expected.as_deref()).await
+                    });
+                }
+                // About that one connection; the listener is still good.
+                Err(e) => warn!("Bandwidth upgrade: accept failed: {e}"),
+            },
+            Some(done) = introducing.join_next() => match done {
+                Ok(Ok(socket)) => {
+                    match &upgrade_tx {
+                        Some(tx) => {
+                            if tx.send(socket).is_err() {
+                                warn!("Bandwidth upgrade: nothing left to hand the upgraded socket to");
+                            }
+                        }
+                        // The upgrade completed but no transport can adopt it,
+                        // so the payload would arrive on a socket nobody reads.
+                        // Say so rather than dropping it silently.
+                        None => warn!(
+                            "Bandwidth upgrade: introduced, but this transport cannot adopt the \
+                             upgraded socket"
+                        ),
+                    }
+                    return;
+                }
+                Ok(Err(e)) => warn!("Bandwidth upgrade: rejected a connection: {e}"),
+                Err(e) => warn!("Bandwidth upgrade: introduction task failed: {e}"),
+            },
+        }
+    }
+}
+
 /// Read the phone's CLIENT_INTRODUCTION off the freshly-joined WiFi Direct
 /// socket and answer it with CLIENT_INTRODUCTION_ACK.
 ///
@@ -2612,6 +2626,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
 ))]
 pub(crate) async fn introduce_upgraded_channel(
     mut socket: tokio::net::TcpStream,
+    expected_endpoint_id: Option<&str>,
 ) -> Result<tokio::net::TcpStream, anyhow::Error> {
     use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
         ClientIntroductionAck, EventType,
@@ -2641,6 +2656,16 @@ pub(crate) async fn introduce_upgraded_channel(
         .ok_or_else(|| anyhow!("first frame on the upgraded socket was not CLIENT_INTRODUCTION"))?;
 
     info!("*** Bandwidth upgrade: CLIENT_INTRODUCTION from endpoint_id={endpoint_id:?} ***");
+
+    // Anyone on the network can reach the listener; only the peer we are
+    // already talking to may take the transfer over to it.
+    if let Some(expected) = expected_endpoint_id {
+        if endpoint_id.as_deref() != Some(expected) {
+            return Err(anyhow!(
+                "introduced as {endpoint_id:?}, but this transfer is with {expected:?}"
+            ));
+        }
+    }
 
     let ack = OfflineFrame {
         version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
@@ -2690,5 +2715,101 @@ mod tests {
         assert!(!v4.is_link_local());
         assert!(!(v4.octets()[0] == 192 && v4.octets()[1] == 168 && v4.octets()[2] == 137));
         assert!(!(v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64));
+    }
+
+    /// A length-prefixed CLIENT_INTRODUCTION, as the phone sends it on the
+    /// upgraded socket.
+    fn introduction(endpoint_id: &str) -> Vec<u8> {
+        use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            ClientIntroduction, EventType,
+        };
+        use crate::location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+
+        let frame = OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                        .into(),
+                ),
+                bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(EventType::ClientIntroduction.into()),
+                    client_introduction: Some(ClientIntroduction {
+                        endpoint_id: Some(endpoint_id.to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+        .encode_to_vec();
+        let mut out = (frame.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&frame);
+        out
+    }
+
+    /// A silent connection and one introducing itself as someone else must
+    /// neither win nor block the peer of this transfer.
+    #[tokio::test]
+    async fn upgrade_listener_adopts_only_this_transfers_peer() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut adopted) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(serve_upgrade_listener(
+            listener,
+            Some("ABCD".to_string()),
+            Some(tx),
+            session.clone(),
+        ));
+
+        let silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut impostor = tokio::net::TcpStream::connect(addr).await.unwrap();
+        impostor.write_all(&introduction("ZZZZ")).await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(addr).await.unwrap();
+        peer.write_all(&introduction("ABCD")).await.unwrap();
+
+        // The timeouts only turn a hang into a failure.
+        let wait = std::time::Duration::from_secs(10);
+        let socket = tokio::time::timeout(wait, adopted.recv())
+            .await
+            .expect("the peer was never adopted")
+            .expect("the listener dropped the sink");
+        assert_eq!(socket.peer_addr().unwrap(), peer.local_addr().unwrap());
+
+        // The peer got its CLIENT_INTRODUCTION_ACK...
+        let mut len = [0u8; 4];
+        tokio::time::timeout(wait, peer.read_exact(&mut len))
+            .await
+            .expect("no ACK")
+            .unwrap();
+        // ...and the listener stopped once it had its connection, with the
+        // silent one still open.
+        tokio::time::timeout(wait, server)
+            .await
+            .expect("the listener kept running")
+            .unwrap();
+        drop(silent);
+    }
+
+    #[tokio::test]
+    async fn upgrade_listener_ends_with_the_transfer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let session = tokio_util::sync::CancellationToken::new();
+        let server = tokio::spawn(serve_upgrade_listener(
+            listener,
+            Some("ABCD".to_string()),
+            None,
+            session.clone(),
+        ));
+
+        session.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the listener outlived its transfer")
+            .unwrap();
     }
 }
