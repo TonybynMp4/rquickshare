@@ -135,6 +135,9 @@ pub struct BleReceiverAdvertiser {
     device_type: u8,
     name: String,
     sender: tokio::sync::broadcast::Sender<crate::channel::ChannelMessage>,
+    /// Hidden means not discoverable over Bluetooth either: the advertisement
+    /// is paused while hidden, except under a phone that is already connected.
+    visibility: tokio::sync::watch::Receiver<crate::hdl::Visibility>,
 }
 
 impl BleReceiverAdvertiser {
@@ -143,12 +146,14 @@ impl BleReceiverAdvertiser {
         device_type: u8,
         name: String,
         sender: tokio::sync::broadcast::Sender<crate::channel::ChannelMessage>,
+        visibility: tokio::sync::watch::Receiver<crate::hdl::Visibility>,
     ) -> Self {
         Self {
             endpoint_id,
             device_type,
             name,
             sender,
+            visibility,
         }
     }
 
@@ -697,6 +702,7 @@ impl BleReceiverAdvertiser {
             }
         });
 
+        let visibility = self.visibility.clone();
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -1317,15 +1323,33 @@ impl BleReceiverAdvertiser {
                 // advertisement drops connected GATT clients, so doing this on
                 // an inbound transfer would tear down the session it is meant
                 // to protect.
-                let want_paused = crate::hdl::ble_send_in_progress();
+                //
+                // Hidden pauses it too, so a hidden PC isn't discoverable over
+                // Bluetooth while mDNS has already gone quiet - but only with no
+                // phone subscribed, for the same reason: a receive in progress
+                // keeps the advertisement, and it stops once that phone leaves.
+                let hidden = *visibility.borrow() == crate::hdl::Visibility::Invisible;
+                let subscribed = server_tx
+                    .SubscribedClients()
+                    .and_then(|c| c.Size())
+                    .unwrap_or(0)
+                    > 0;
+                let sending = crate::hdl::ble_send_in_progress();
+                let want_paused = sending || (hidden && !subscribed);
                 if want_paused != adv_paused {
                     if want_paused {
-                        let _ = provider.StopAdvertising();
-                        info!("{INNER_NAME}: BLE send in progress, pausing the advertisement");
+                        if let Err(e) = provider.StopAdvertising() {
+                            warn!("{INNER_NAME}: could not pause the advertisement: {e}");
+                        }
+                        if sending {
+                            info!("{INNER_NAME}: BLE send in progress, pausing the advertisement");
+                        } else {
+                            info!("{INNER_NAME}: hidden, pausing the advertisement");
+                        }
                     } else {
                         match provider.StartAdvertisingWithParameters(&params) {
                             Ok(()) => {
-                                info!("{INNER_NAME}: BLE send finished, resuming the advertisement")
+                                info!("{INNER_NAME}: resuming the advertisement")
                             }
                             Err(e) => {
                                 warn!("{INNER_NAME}: could not resume advertising: {e}")
@@ -1368,7 +1392,9 @@ impl BleReceiverAdvertiser {
                              keeping the advertisement up so the phone keeps listing us"
                         );
                     } else {
-                        let _ = provider.StopAdvertising();
+                        if let Err(e) = provider.StopAdvertising() {
+                            warn!("{INNER_NAME}: could not stop advertising to recycle: {e}");
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         match provider.StartAdvertisingWithParameters(&params) {
                             Ok(()) => {
@@ -1408,11 +1434,56 @@ impl BleReceiverAdvertiser {
             }
 
             info!("{INNER_NAME}: tracker cancelled, stopping advertiser");
-            let _ = provider.StopAdvertising();
+            if let Err(e) = provider.StopAdvertising() {
+                warn!("{INNER_NAME}: could not stop advertising: {e}");
+            }
             Ok(())
         })
         .await??;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs the receiver on the machine's real Bluetooth adapter and flips
+    /// visibility; read the log for "hidden, pausing" and "resuming". Run by hand:
+    /// `cargo test -p rqs_lib hidden_pauses_the_advertisement -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a Bluetooth adapter; check the log"]
+    async fn hidden_pauses_the_advertisement() {
+        use crate::hdl::Visibility;
+
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+        let (visibility, watcher) = tokio::sync::watch::channel(Visibility::Visible);
+        let (sender, _) = tokio::sync::broadcast::channel(8);
+        let receiver =
+            BleReceiverAdvertiser::new([1, 2, 3, 4], 3, "rqs-test".to_string(), sender, watcher);
+        let ctk = CancellationToken::new();
+        let run = tokio::spawn({
+            let ctk = ctk.clone();
+            async move { receiver.run(ctk).await }
+        });
+
+        // The loop under test still ticks on a timer (#60), so give it time to
+        // act on each change.
+        let settle = std::time::Duration::from_secs(2);
+        tokio::time::sleep(settle).await;
+        if visibility.send(Visibility::Invisible).is_err() {
+            panic!("the receiver stopped early: {:?}", run.await);
+        }
+        tokio::time::sleep(settle).await;
+        visibility.send(Visibility::Visible).unwrap();
+        tokio::time::sleep(settle).await;
+
+        ctk.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("the receiver did not stop on cancel")
+            .unwrap()
+            .unwrap();
     }
 }
