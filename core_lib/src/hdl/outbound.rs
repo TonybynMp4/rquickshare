@@ -1749,13 +1749,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             | sharing_nearby::connection_response_frame::Status::NotEnoughSpace
             | sharing_nearby::connection_response_frame::Status::UnsupportedAttachmentType
             | sharing_nearby::connection_response_frame::Status::TimedOut => {
-                warn!(
-                    "Cannot process: consent denied: {:?}",
-                    v1_frame.connection_response.as_ref().unwrap().status()
-                );
+                let status = v1_frame.connection_response.as_ref().unwrap().status();
+                warn!("Cannot process: consent denied: {status:?}");
+                // A decline is the receiver's answer, not a failure, and the UI
+                // says "Transfer rejected" for it. It used to be reported as
+                // Disconnected, which shows "Unexpected disconnection". The
+                // other statuses are the transfer failing on the receiver's
+                // side - no space, a type it can't take, nobody answering.
+                let state = if status == sharing_nearby::connection_response_frame::Status::Reject {
+                    State::Rejected
+                } else {
+                    State::Disconnected
+                };
                 self.update_state(
                     |e| {
-                        e.state = State::Disconnected;
+                        e.state = state;
                     },
                     true,
                 )
@@ -2521,6 +2529,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 mod tests {
     use super::*;
     use crate::utils::DeviceType;
+
+    /// A decline on the receiver is Rejected, which the UI shows as "Transfer
+    /// rejected"; the other refusals are failures and stay Disconnected.
+    #[tokio::test]
+    async fn a_decline_is_rejected_and_other_refusals_are_failures() {
+        use crate::sharing_nearby::connection_response_frame::Status;
+
+        for (status, expected) in [
+            (Status::Reject, State::Rejected),
+            (Status::NotEnoughSpace, State::Disconnected),
+            (Status::UnsupportedAttachmentType, State::Disconnected),
+            (Status::TimedOut, State::Disconnected),
+        ] {
+            let (ours, _theirs) = tokio::io::duplex(64 * 1024);
+            let mut or = OutboundRequest::new(
+                *b"abcd",
+                ours,
+                "send-1".to_owned(),
+                tokio::sync::broadcast::channel(16).0,
+                OutboundPayload::Text("hello".to_owned()),
+                RemoteDeviceInfo {
+                    name: "peer".to_owned(),
+                    device_type: DeviceType::Laptop,
+                },
+            );
+            or.state.state = State::SentIntroduction;
+
+            let answer = sharing_nearby::V1Frame {
+                r#type: Some(sharing_nearby::v1_frame::FrameType::Response.into()),
+                connection_response: Some(sharing_nearby::ConnectionResponseFrame {
+                    status: Some(status.into()),
+                }),
+                ..Default::default()
+            };
+            let ended = or.process_consent(&answer).await;
+            assert!(matches!(
+                ended
+                    .expect_err("a refusal ends the transfer")
+                    .downcast_ref(),
+                Some(crate::errors::AppError::NotAnError)
+            ));
+            assert_eq!(or.state.state, expected, "for {status:?}");
+        }
+    }
 
     /// Waiting for the peer to release the old channel used to ignore Cancel
     /// until a frame arrived. With no frame coming at all, Cancel has to end
