@@ -252,12 +252,31 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let state: tauri::State<'_, AppState> = capp_handle.state();
         let mut receiver = state.message_sender.subscribe();
+        // Progress comes on its own channel (see rqs_lib::channel::PROGRESS).
+        // Read here, in the same task as the state messages, so the gate can
+        // drop progress that turns up after a transfer's final state.
+        let mut progress = rqs_lib::channel::subscribe_progress();
+        let mut gate = rqs_lib::channel::ProgressGate::default();
 
         loop {
-            let rinfo = receiver.recv().await;
+            let rinfo = tokio::select! {
+                rinfo = receiver.recv() => rinfo,
+                changed = progress.changed() => {
+                    if changed.is_err() {
+                        // The board lives for the whole process; this is shutdown.
+                        break;
+                    }
+                    let fresh = gate.fresh(&progress.borrow_and_update());
+                    for msg in fresh {
+                        rs2js_channelmessage(msg, &capp_handle);
+                    }
+                    continue;
+                }
+            };
 
             match rinfo {
                 Ok(info) => {
+                    gate.saw_state(&info);
                     if info.state.as_ref().unwrap_or(&State::Initial)
                         == &State::WaitingForUserConsent
                     {
@@ -298,9 +317,13 @@ fn spawn_receiver_tasks(app_handle: &AppHandle) {
                     }
                     rs2js_channelmessage(info, &capp_handle);
                 }
-                Err(e) => {
-                    error!("RecvError: message_sender: {e}");
+                // Behind on state messages; the next ones still arrive.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("message_sender: skipped {n} messages");
                 }
+                // Every sender is gone: the library has shut down. Without
+                // this the loop spun on the same error forever.
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });

@@ -115,13 +115,6 @@ pub struct InboundRequest<S> {
         any(target_os = "linux", target_os = "windows")
     ))]
     switch_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
-    /// When we last broadcast a receive-progress update. A per-chunk broadcast
-    /// floods the shared ChannelMessage bus - thousands of messages during a
-    /// fast transfer - overflowing its 50-slot buffer so this handler's own
-    /// subscription (watching for a UI cancel) lags and logs "channel lagged",
-    /// and risks dropping the cancel. Byte counts still advance every chunk; the
-    /// broadcast is throttled to this.
-    last_progress_broadcast: Option<std::time::Instant>,
     /// Receive-throughput profiling, reset every report. Splits wall-clock time
     /// into decrypt (HMAC + AES + protobuf decode) and disk write, so a slow
     /// transfer shows where the time actually goes rather than us guessing.
@@ -172,7 +165,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             wifi_direct: None,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             wifi_direct_creds: None,
-            last_progress_broadcast: None,
             prof_decrypt: std::time::Duration::ZERO,
             prof_aes: std::time::Duration::ZERO,
             prof_write: std::time::Duration::ZERO,
@@ -1661,29 +1653,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                                 self.prof_since = Some(now);
                             }
 
-                            // Advance the byte count every chunk, but broadcast
-                            // it at most every 100ms - see last_progress_broadcast.
-                            // 100ms is smooth for a progress bar and keeps the
-                            // shared channel from overflowing. The final state is
-                            // always broadcast on completion below, so the bar
-                            // still lands on 100%.
-                            let now = std::time::Instant::now();
-                            let due = self
-                                .last_progress_broadcast
-                                .map(|t| now.duration_since(t) >= Duration::from_millis(100))
-                                .unwrap_or(true);
-                            if due {
-                                self.last_progress_broadcast = Some(now);
-                            }
+                            // Every chunk updates the progress board; see
+                            // channel::PROGRESS for why it isn't broadcast.
                             self.update_state(
                                 |e| {
                                     if let Some(tmd) = e.transfer_metadata.as_mut() {
                                         tmd.ack_bytes += chunk_size as u64;
                                     }
                                 },
-                                due,
+                                false,
                             )
                             .await;
+                            self.publish_progress();
                         } else if (chunk.flags() & 1) == 1 {
                             if file_internal.bytes_transferred != file_internal.total_size {
                                 return Err(anyhow!(
@@ -2563,6 +2544,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         self.state.client_seq
     }
 
+    /// This transfer as the front end sees it.
+    fn state_message(&self) -> ChannelMessage {
+        ChannelMessage {
+            id: self.state.id.clone(),
+            direction: ChannelDirection::LibToFront,
+            rtype: Some(crate::channel::TransferType::Inbound),
+            state: Some(self.state.state.clone()),
+            meta: self.state.transfer_metadata.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn publish_progress(&self) {
+        crate::channel::publish_progress(self.state_message());
+    }
+
     async fn update_state<F>(&mut self, f: F, inform: bool)
     where
         F: FnOnce(&mut InnerState),
@@ -2574,14 +2571,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         }
 
         trace!("Sending msg into the channel");
-        let _ = self.sender.send(ChannelMessage {
-            id: self.state.id.clone(),
-            direction: ChannelDirection::LibToFront,
-            rtype: Some(crate::channel::TransferType::Inbound),
-            state: Some(self.state.state.clone()),
-            meta: self.state.transfer_metadata.clone(),
-            ..Default::default()
-        });
+        let _ = self.sender.send(self.state_message());
+        if matches!(
+            self.state.state,
+            State::Finished | State::Cancelled | State::Rejected | State::Disconnected
+        ) {
+            crate::channel::clear_progress(&self.state.id);
+        }
         // Let the receivers run before the next update. This was a 10us sleep,
         // which tokio rounds up to a whole millisecond per update; yielding
         // hands the turn over without a timer.

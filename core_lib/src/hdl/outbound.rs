@@ -205,11 +205,6 @@ pub struct OutboundRequest<S> {
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
     payload: OutboundPayload,
-    /// When we last broadcast a send-progress update. Per-chunk broadcasts flood
-    /// the shared ChannelMessage bus and overflow its buffer, so the byte count
-    /// advances every chunk but the broadcast is throttled to this. Mirrors the
-    /// receive path.
-    last_progress_broadcast: Option<std::time::Instant>,
     /// Where the upgrade listener delivers the socket the peer connected on,
     /// and the signal that the old channel has been released. Set by the BLE
     /// send path, which is the only transport that can adopt an upgraded socket
@@ -303,7 +298,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             sender,
             receiver,
             payload,
-            last_progress_broadcast: None,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             upgrade_tx: None,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
@@ -1582,17 +1576,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 						};
 
                         self.encrypt_and_send(&wrapper).await?;
-                        // Advance every chunk, broadcast at most every 100ms -
-                        // see last_progress_broadcast. Completion is broadcast
-                        // separately, so the bar still reaches 100%.
-                        let now = std::time::Instant::now();
-                        let due = self
-                            .last_progress_broadcast
-                            .map(|t| now.duration_since(t) >= std::time::Duration::from_millis(100))
-                            .unwrap_or(true);
-                        if due {
-                            self.last_progress_broadcast = Some(now);
-                        }
+                        // Every chunk updates the progress board; see
+                        // channel::PROGRESS for why it isn't broadcast.
                         self.update_state(
                             |e| {
                                 if let Some(mu) = e.transferred_files.get_mut(&current) {
@@ -1603,9 +1588,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                                     tmd.ack_bytes += bytes_read as u64;
                                 }
                             },
-                            due,
+                            false,
                         )
                         .await;
+                        self.publish_progress();
 
                         // If we just sent the last bytes of the file, mark it as finished
                         if curr_state.bytes_transferred + bytes_read as i64 == curr_state.total_size
@@ -2348,6 +2334,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         self.state.client_seq
     }
 
+    /// This transfer as the front end sees it.
+    fn state_message(&self) -> ChannelMessage {
+        ChannelMessage {
+            id: self.state.id.clone(),
+            direction: ChannelDirection::LibToFront,
+            rtype: Some(crate::channel::TransferType::Outbound),
+            state: Some(self.state.state.clone()),
+            meta: self.state.transfer_metadata.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn publish_progress(&self) {
+        crate::channel::publish_progress(self.state_message());
+    }
+
     async fn update_state<F>(&mut self, f: F, inform: bool)
     where
         F: FnOnce(&mut InnerState),
@@ -2358,14 +2360,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             return;
         }
 
-        let _ = self.sender.send(ChannelMessage {
-            id: self.state.id.clone(),
-            direction: ChannelDirection::LibToFront,
-            rtype: Some(crate::channel::TransferType::Outbound),
-            state: Some(self.state.state.clone()),
-            meta: self.state.transfer_metadata.clone(),
-            ..Default::default()
-        });
+        let _ = self.sender.send(self.state_message());
+        if matches!(
+            self.state.state,
+            State::Finished | State::Cancelled | State::Rejected | State::Disconnected
+        ) {
+            crate::channel::clear_progress(&self.state.id);
+        }
         // Let the receivers run before the next update. This was a 10us sleep,
         // which tokio rounds up to a whole millisecond per update; yielding
         // hands the turn over without a timer.
