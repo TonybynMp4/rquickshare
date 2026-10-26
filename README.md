@@ -12,7 +12,7 @@
   </p>
 </div>
 
-![demo image](.github/demo.png)
+![The rquickshare window, ready to receive](.github/demo.png)
 
 Send and receive files, text and links between an Android phone and your computer, using the same Quick Share your phone already has.
 
