@@ -105,8 +105,12 @@ impl BleReceiverAdvertiser {
             Arc::new(Mutex::new(None));
         let down_slot: Arc<Mutex<Option<mpsc::UnboundedSender<()>>>> = Arc::new(Mutex::new(None));
 
-        // Signalled when a Weave ConnectionRequest arrives from a phone
-        let (new_session_tx, mut new_session_rx) = mpsc::unbounded_channel::<()>();
+        // The device the current session belongs to; see `ActivePeer`.
+        let active = Arc::new(Mutex::new(ble_receiver::ActivePeer::default()));
+
+        // Signalled when a Weave ConnectionRequest arrives from a phone, with the
+        // generation of the session to start.
+        let (new_session_tx, mut new_session_rx) = mpsc::unbounded_channel::<u64>();
 
         // Outbound Weave sender channel currently registered by the active GATT subscriber
         let current_sub_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>> =
@@ -257,14 +261,60 @@ impl BleReceiverAdvertiser {
                                 let send_pkt = send_pkt.clone();
                                 let new_session_tx = new_session_tx.clone();
                                 let inbound_slot = inbound_slot.clone();
-                                move |mut buf, _req| {
+                                let active = active.clone();
+                                let adapter = adapter.clone();
+                                move |mut buf, req| {
                                     let rx_buf = rx_buf.clone();
                                     let tx_counter = tx_counter.clone();
                                     let send_pkt = send_pkt.clone();
                                     let new_session_tx = new_session_tx.clone();
                                     let inbound_slot = inbound_slot.clone();
+                                    let active = active.clone();
+                                    let adapter = adapter.clone();
                                     async move {
                                         if buf.is_empty() {
+                                            return Ok(());
+                                        }
+
+                                        // Whose write this is. A ConnectionRequest may
+                                        // start a session; anything else must come from
+                                        // the device whose session it is.
+                                        let device = req.device_address.to_string();
+                                        let is_request = buf[0] & 0x80 != 0 && buf[0] & 0x0f == 0;
+                                        let mut started: Option<u64> = None;
+                                        let allowed = if is_request {
+                                            let owner = active
+                                                .lock()
+                                                .ok()
+                                                .and_then(|a| a.device().map(str::to_string));
+                                            // An owner that is no longer connected has
+                                            // lost its link; its session only hasn't
+                                            // noticed yet.
+                                            let owner_connected = match owner
+                                                .and_then(|o| o.parse::<bluer::Address>().ok())
+                                            {
+                                                Some(address) => match adapter.device(address) {
+                                                    Ok(d) => d.is_connected().await.unwrap_or(false),
+                                                    Err(_) => false,
+                                                },
+                                                None => false,
+                                            };
+                                            if let Ok(mut a) = active.lock() {
+                                                started = a.start(&device, owner_connected);
+                                            }
+                                            started.is_some()
+                                        } else {
+                                            active.lock().is_ok_and(|a| a.owns(&device))
+                                        };
+                                        if !allowed {
+                                            if is_request {
+                                                info!(
+                                                    "{INNER_NAME}: ignoring a ConnectionRequest from \
+                                                     {device}: another device's session is active"
+                                                );
+                                            } else {
+                                                trace!("{INNER_NAME}: ignoring a write from {device}, not this session's");
+                                            }
                                             return Ok(());
                                         }
 
@@ -356,7 +406,11 @@ impl BleReceiverAdvertiser {
                                                     "*** {INNER_NAME}: sending ConnectionConfirm (v{version}, {packet_size} B) ***"
                                                 );
                                                 send_pkt(confirm);
-                                                let _ = new_session_tx.send(());
+                                                if let Some(generation) = started {
+                                                    if new_session_tx.send(generation).is_err() {
+                                                        warn!("{INNER_NAME}: the session supervisor is gone");
+                                                    }
+                                                }
                                             } else {
                                                 info!("{INNER_NAME}: weave control cmd={cmd} {buf:02x?}");
                                             }
@@ -417,10 +471,12 @@ impl BleReceiverAdvertiser {
         let session_send_pkt = send_pkt.clone();
         let session_tx_pending = tx_pending.clone();
         let session_tx_drained = tx_drained.clone();
+        let session_active = active.clone();
 
         tokio::spawn(async move {
-            while new_session_rx.recv().await.is_some() {
+            while let Some(generation) = new_session_rx.recv().await {
                 info!("{INNER_NAME}: new Weave connection, starting fresh session");
+                let end_active = session_active.clone();
 
                 let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
                 let (down_tx, mut down_rx) = mpsc::unbounded_channel::<()>();
@@ -469,6 +525,11 @@ impl BleReceiverAdvertiser {
                                 break;
                             }
                         }
+                    }
+                    // Free the server for the next device, unless a newer
+                    // session already took it.
+                    if let Ok(mut active) = end_active.lock() {
+                        active.end(generation);
                     }
                 });
 
