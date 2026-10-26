@@ -56,9 +56,9 @@ async fn run_handshake() -> (InboundRequest<DuplexStream>, OutboundRequest<Duple
         .expect("send_ukey2_client_init");
 
     // The duplex buffers, so the sides need not run in lockstep: each drives
-    // itself until its own half of the handshake is done. Inbound finishes one
-    // frame earlier than outbound, which then reads the already-buffered
-    // connection response.
+    // itself until its own half of the handshake is done. Both end having sent
+    // their connection response; outbound then waits for inbound's paired key
+    // encryption, which is already buffered.
     let inbound = async move {
         while ir.state.state != State::SentConnectionResponse {
             ir.handle().await.expect("inbound handle");
@@ -66,7 +66,7 @@ async fn run_handshake() -> (InboundRequest<DuplexStream>, OutboundRequest<Duple
         ir
     };
     let outbound = async move {
-        while or.state.state != State::SentPairedKeyEncryption {
+        while or.state.state != State::SentConnectionResponse {
             or.handle().await.expect("outbound handle");
         }
         or
