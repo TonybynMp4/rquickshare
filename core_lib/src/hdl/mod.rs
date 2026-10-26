@@ -35,10 +35,8 @@ mod blea_recv_win;
 #[cfg(all(feature = "experimental", target_os = "windows"))]
 pub use blea_recv_win::*;
 // Pure byte-format builders for the BLE receiver advertisement, unit-tested.
-// Compiled only where their sole consumer (blea_recv_win) is, so nothing is
-// dead code on other targets - no blanket `allow(dead_code)` needed.
-// Not Windows-only any more: the send path parses a *peer's* advertisement with
-// the same code that builds ours, and that path runs on Linux too.
+// The builders are used by the Windows and Linux receivers, and the send path
+// parses a *peer's* advertisement with the same code on every platform.
 #[cfg(feature = "experimental")]
 mod ble_receiver;
 #[cfg(feature = "experimental")]

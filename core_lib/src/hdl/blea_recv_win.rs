@@ -158,19 +158,19 @@ impl BleReceiverAdvertiser {
     }
 
     pub async fn run(&self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
-        // Two forms, two channels:
-        //  - fast: compact, for the advertisement packet's service data.
+        // Two pieces, two channels:
+        //  - header: the advertisement packet's service data. Says there is an
+        //    advertisement to read over GATT and carries its hash.
         //  - full: served over GATT when a peer connects. Carries the device
         //    name, which is what the phone needs to build a listable
         //    ShareTarget. Serving the *fast* form here was why the phone read us
         //    successfully and still never listed us.
-        let advertisement =
-            ble_receiver::build_fast_receiver_advertisement(&self.endpoint_id, self.device_type);
         let full_advertisement = ble_receiver::build_full_receiver_advertisement(
             &self.endpoint_id,
             self.device_type,
             &self.name,
         );
+        let header = ble_receiver::build_advertisement_header(&full_advertisement);
 
         // Bridge between the WinRT/GATT world and the async Nearby stack.
         //  inbound : write handler -> (strip fc9f5e) -> duplex -> InboundRequest
@@ -752,21 +752,22 @@ impl BleReceiverAdvertiser {
                 Ok(())
             }))?;
 
-            // Connectable: puts the 0xFEF3 service UUID on-air so the phone's
-            // receiver scan finds us. A GATT service must be connectable to
-            // advertise at all (non-connectable -> status 3 Aborted). Our 26-byte
-            // fast advertisement won't also fit the packet (-> status 4,
-            // StartedWithoutAllAdvertisementData), so it is NOT delivered inline;
-            // the phone fetches the advertisement/metadata over the GATT
-            // connection instead (isPrivateGatt / rxAdvertisement). That GATT
-            // characteristic is the next piece to build - for now this just gets
-            // the UUID discoverable so we can confirm the phone finds us.
+            // Connectable: a GATT service must be connectable to advertise at
+            // all (non-connectable -> status 3 Aborted). The service data is the
+            // 17-byte advertisement header, which tells the phone's scan to read
+            // the full advertisement over GATT (isPrivateGatt / rxAdvertisement).
+            // The 26-byte fast advertisement that used to go here was dropped by
+            // Windows, and with only the bare UUID on air the phone almost never
+            // read us. The header does reach the phone - its log shows "Received
+            // advertisement header ... numSlots=1" and a read within seconds -
+            // although Windows still reports status 4
+            // (StartedWithoutAllAdvertisementData) for whatever else it leaves out.
             let params = GattServiceProviderAdvertisingParameters::new()?;
             params.SetIsConnectable(true)?;
             params.SetIsDiscoverable(false)?;
 
             let writer = DataWriter::new()?;
-            writer.WriteBytes(&advertisement)?;
+            writer.WriteBytes(&header)?;
             params.SetServiceData(&writer.DetachBuffer()?)?;
 
             // BLE socket: server-tx (us -> phone, via notify). Created first so
@@ -1118,7 +1119,7 @@ impl BleReceiverAdvertiser {
             provider.StartAdvertisingWithParameters(&params)?;
             info!(
                 "{INNER_NAME}: GATT service advertising started ({} B service data) under 0xFEF3",
-                advertisement.len()
+                header.len()
             );
 
             // Outbound Weave: split whole [hash][len][frame] messages from the

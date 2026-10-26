@@ -2,27 +2,21 @@
 //! advertisement (issue #425), so a phone doing BLE-only discovery lists this
 //! machine as a target.
 //!
-//! This builds the **fast** advertisement, which is what Google's Windows Quick
-//! Share actually broadcasts - captured from a Pixel's logcat while it
-//! discovered Google's app with WiFi off:
+//! Two pieces, following google/nearby's GATT route:
+//!  - the **advertisement header**, 17 bytes in the 0xFEF3 service data. It
+//!    tells a scanning phone there is a NearbySharing advertisement to read
+//!    over GATT, and its hash;
+//!  - the **full advertisement**, served from the slot-0 GATT characteristic,
+//!    which carries the device name the phone needs to list us.
 //!
-//! ```text
-//! BleAdvertisement { version=2, socketVersion=2, isFast=true, serviceIdHash=null,
-//!   data=[0x23 0x4e 0x58 0x38 0x47 0x11 0x16 ...23 bytes], deviceToken=[0x74 0xeb] }
-//!   matched 0000fef3 in fastAdvertisementServiceUuids -> Discovered endpoint NX8G
-//! ```
+//! The 0xFEF3 service data used to hold the 26-byte *fast* advertisement
+//! instead. A connectable advertisement from Windows has no room for it, so
+//! Windows dropped it and only the bare 0xFEF3 UUID went on air. The phone then
+//! had nothing telling it to read us, and found us only on the rare scan where
+//! it tried a GATT read anyway.
 //!
-//! The fast form is compact enough to fit a *legacy* 31-byte advertisement under
-//! 0xFEF3 - no extended advertising and no GATT round trip to be discovered. It
-//! carries no inline device name (too small); the name comes from the account
-//! for a self-share, or a later GATT read for an unknown sender (next milestone).
-//!
-//! Layouts (from google/nearby `ble_advertisement.cc`, fast branch):
-//!   Layer 3: [VER/PCP=0x23][ENDPOINT_ID(4)][INFO_SIZE(1)][ENDPOINT_INFO(n)]
-//!   Layer 2: [VER/SOCK/FAST=0x4A][DATA(Layer3)][DEVICE_TOKEN(2)]
-//! The non-fast form + advertisement header (bloom filter, GATT) lived here too;
-//! removed when the fast path replaced it. See git history / the doc if the GATT
-//! full-advertisement milestone needs them back.
+//! Phones still advertise in the fast form, so its parser stays for the send
+//! path. Layouts are from google/nearby `connections/implementation/mediums/ble`.
 
 use sha2::{Digest, Sha256};
 
@@ -45,57 +39,29 @@ fn device_token() -> [u8; 2] {
     [v[0], v[1]]
 }
 
-/// Fast endpoint info, byte-matched to Google's Windows laptop advertisement
-/// captured from the phone: first byte 0x16 for a Laptop, then 16 bytes of
-/// salt + metadata key.
+/// Service-ID bloom filter for "NearbySharing": google/nearby's `BloomFilter`
+/// over 80 bits, five positions from the low 64 bits of
+/// MurmurHash3_x64_128("NearbySharing", seed 0), position `p` stored in byte
+/// `p / 8`, bit `p % 8`. The service ID never changes, so this is a constant;
+/// the derivation was checked against an independent MurmurHash3.
+const NEARBY_SHARING_BLOOM_FILTER: [u8; 10] =
+    [0x20, 0x00, 0x00, 0x10, 0x02, 0x00, 0x00, 0x03, 0x00, 0x00];
+
+/// The `BleAdvertisementHeader` for the 0xFEF3 service data:
+/// `[version/extended/num_slots][bloom filter(10)][advertisement hash(4)][psm(2)]`.
 ///
-/// The 0x16 = `(device_type << 1) | 0x10`. Google's *laptop* advert (deviceType
-/// 3, the one this phone lists and transfers to) uses this exact byte, so we do
-/// too. (An earlier detour cleared the 0x10 bit based on a mis-read discovery
-/// that turned out to be a different phone, deviceType 1, byte 0x32 - not us.)
-#[cfg(any(target_os = "windows", test))]
-fn build_endpoint_info_fast(device_type: u8) -> Vec<u8> {
-    let mut info = Vec::new();
-    info.push((device_type << 1) | 0x10);
-    let salt_and_meta: [u8; 16] = rand::random();
-    info.extend_from_slice(&salt_and_meta);
-    info
-}
-
-/// Layer 3 fast: `[version/pcp][endpoint_id(4)][info_len(1)][endpoint_info]`.
-/// Omits service_id_hash, bluetooth_mac, uwb and extra_field (all non-fast only),
-/// per google's `BleAdvertisement::operator ByteArray` fast branch.
-#[cfg(any(target_os = "windows", test))]
-fn build_connections_advertisement_fast(endpoint_id: &[u8; 4], endpoint_info: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(0x23); // (version 1 << 5) | pcp 3
-    out.extend_from_slice(endpoint_id);
-    out.push(endpoint_info.len() as u8);
-    out.extend_from_slice(endpoint_info);
+/// Version 2, no extended advertising and one slot, so the phone reads the
+/// full advertisement from slot 0 over GATT. The hash is SHA-256 of exactly the
+/// bytes that characteristic serves; the phone checks the two match. No L2CAP,
+/// so the PSM is 0.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub fn build_advertisement_header(full_advertisement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17);
+    out.push((2u8 << 5) | 1);
+    out.extend_from_slice(&NEARBY_SHARING_BLOOM_FILTER);
+    out.extend_from_slice(&sha256_prefix(full_advertisement, 4));
+    out.extend_from_slice(&[0, 0]);
     out
-}
-
-/// Layer 2 fast: `[version/socket/fast byte][data][device_token(2)]`. No
-/// service_id_hash and no 4-byte data_size (fast omits both); the reader takes
-/// the last 2 bytes as the token and the rest as data.
-#[cfg(any(target_os = "windows", test))]
-fn build_medium_advertisement_fast(data: &[u8], device_token: &[u8; 2]) -> Vec<u8> {
-    let mut out = Vec::new();
-    // version kV2(2) | socket kV2(2) | fast=1 | second_profile=0 = 0x4A
-    let version_byte = ((2u8 << 5) & 0xE0) | ((2u8 << 2) & 0x1C) | 0x02;
-    out.push(version_byte);
-    out.extend_from_slice(data);
-    out.extend_from_slice(device_token);
-    out
-}
-
-/// The complete fast BleAdvertisement to place in the 0xFEF3 service data of a
-/// legacy BLE advertisement.
-#[cfg(any(target_os = "windows", test))]
-pub fn build_fast_receiver_advertisement(endpoint_id: &[u8; 4], device_type: u8) -> Vec<u8> {
-    let endpoint_info = build_endpoint_info_fast(device_type);
-    let data = build_connections_advertisement_fast(endpoint_id, &endpoint_info);
-    build_medium_advertisement_fast(&data, &device_token())
 }
 
 // ---- FULL (non-fast) advertisement, served over GATT -----------------------
@@ -195,8 +161,8 @@ pub struct PeerAdvertisement {
 ///
 /// Both are NearbySharing; which one you get depends on the platform. Android
 /// fits the **fast** form (26 bytes) inside the 31-byte legacy advertisement and
-/// broadcasts it inline. Windows cannot - our own 26 bytes are dropped, leaving
-/// advertisement status 4 - so we serve the **full** form from a GATT
+/// broadcasts it inline. A connectable advertisement from Windows has no room
+/// for it, so we advertise a header and serve the **full** form from a GATT
 /// characteristic instead. A peer may therefore be identified straight from its
 /// advertisement, with no connection needed.
 ///
@@ -268,23 +234,39 @@ pub fn parse_full_advertisement(adv: &[u8]) -> Option<(String, u8)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fast_advertisement_matches_google_layout() {
-        // Deterministic bytes checked against the Pixel capture of Google's app.
-        let adv = build_fast_receiver_advertisement(b"NX8G", 3);
+    /// A fast advertisement as a phone broadcasts it: `[0x4A][0x23][id(4)]
+    /// [info_len][info(17)][token(2)]`, with a Laptop's 0x16 bitfield.
+    fn phone_fast_advertisement() -> Vec<u8> {
+        let mut adv = vec![0x4A, 0x23];
+        adv.extend_from_slice(b"NX8G");
+        adv.push(17);
+        adv.push(0x16);
+        adv.extend_from_slice(&[0xAB; 16]);
+        adv.extend_from_slice(&[0x74, 0xEB]);
+        adv
+    }
 
-        // Layer 2 fast version byte: version 2 | socket 2 | fast.
-        assert_eq!(adv[0], 0x4A);
-        // Layer 3 begins: version 1 | pcp 3.
-        assert_eq!(adv[1], 0x23);
-        // endpoint id.
-        assert_eq!(&adv[2..6], b"NX8G");
-        // endpoint_info length = 17 (1 bitfield + 16 salt/key).
-        assert_eq!(adv[6], 17);
-        // bitfield for a Laptop - byte-matches Google's captured 0x16.
-        assert_eq!(adv[7], 0x16);
-        // total: 1 (L2 ver) + 1 (L3 ver) + 4 (id) + 1 (len) + 17 (info) + 2 (token).
-        assert_eq!(adv.len(), 26);
+    #[test]
+    fn header_matches_google_layout() {
+        let full = build_full_receiver_advertisement(b"NX8G", 3, "AaronPC");
+        let header = build_advertisement_header(&full);
+
+        // Small enough to reach the phone from Windows, which the 26-byte fast
+        // advertisement never did.
+        assert_eq!(header.len(), 17);
+        // Version 2, not extended, one slot.
+        assert_eq!(header[0], 0x41);
+        assert_eq!(header[1..11], NEARBY_SHARING_BLOOM_FILTER);
+        assert_eq!(header[11..15], sha256_prefix(&full, 4)[..]);
+        assert_eq!(header[15..], [0, 0]);
+    }
+
+    #[test]
+    fn fast_advertisement_parses() {
+        let peer = parse_peer_advertisement(&phone_fast_advertisement()).expect("parses");
+        assert_eq!(peer.endpoint_id, *b"NX8G");
+        assert_eq!(peer.device_type, 3);
+        assert!(peer.name.is_none());
     }
 
     #[test]
@@ -300,8 +282,7 @@ mod tests {
         // The fast form has no name and no service_id_hash; parsing it as full
         // must fail rather than return garbage, since that is how the send path
         // filters non-Quick-Share peers.
-        let adv = build_fast_receiver_advertisement(b"NX8G", 3);
-        assert!(parse_full_advertisement(&adv).is_none());
+        assert!(parse_full_advertisement(&phone_fast_advertisement()).is_none());
     }
 
     #[test]

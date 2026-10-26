@@ -1,7 +1,7 @@
 //! Linux BLE receiver advertiser using BlueZ via `bluer`.
 //!
 //! Advertises a connectable GATT service under UUID 0xFEF3 (Copresence) carrying the
-//! Nearby Connections fast advertisement in its service data, and serves the full
+//! Nearby Connections advertisement header in its service data, and serves the full
 //! advertisement (with device name and endpoint ID) over characteristic slot 0.
 //! Also hosts the uWeave socket characteristics for BLE transfer and bandwidth upgrade.
 
@@ -91,16 +91,14 @@ impl BleReceiverAdvertiser {
             adapter.address().await?
         );
 
-        // Only the full form is needed. The compact "fast" form would go in the
-        // advertisement packet's service data, but it doesn't fit alongside the
-        // service UUID in a legacy packet - Windows hits the same limit (status
-        // 4, StartedWithoutAllAdvertisementData). The phone finds us by the
-        // 0xFEF3 UUID and reads this over GATT instead.
+        // The full form is served over GATT; the 17-byte header that points the
+        // phone at it goes in the advertisement packet's service data.
         let full_advertisement = ble_receiver::build_full_receiver_advertisement(
             &self.endpoint_id,
             self.device_type,
             &self.name,
         );
+        let header = ble_receiver::build_advertisement_header(&full_advertisement);
 
         // Channels and state shared with GATT handlers
         let inbound_slot: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>> =
@@ -383,15 +381,18 @@ impl BleReceiverAdvertiser {
         info!("{INNER_NAME}: GATT application registered successfully");
 
         // --- Advertise connectable 0xFEF3 service ---
-        // A legacy BLE advertising packet is capped at 31 bytes total.
-        // The 0xFEF3 Service UUID (4 B) + Flags (3 B) = 7 B, easily fitting in
-        // a standard legacy ADV_IND packet (37 B would trigger BlueZ to force
-        // Bluetooth 5 Extended Advertising which Android's legacy scanner cannot see).
-        // Android discovers the receiver by seeing the 0xFEF3 Service UUID on air,
-        // connects, and reads the full advertisement (name + endpoint) over GATT slot 0.
+        // A legacy BLE advertising packet is capped at 31 bytes total: Flags
+        // (3 B) + the 0xFEF3 Service UUID (4 B) + the header as 0xFEF3 service
+        // data (4 + 17 B) = 28 B. Anything over 31 would make BlueZ switch to
+        // Bluetooth 5 Extended Advertising, which Android's legacy scanner
+        // cannot see. The header is what tells the phone's scan that there is a
+        // NearbySharing advertisement to read; with the bare UUID alone the
+        // phone almost never connects. It then reads the full advertisement
+        // (name + endpoint) over GATT slot 0.
         let mut le_advertisement = Advertisement {
             advertisement_type: bluer::adv::Type::Peripheral,
             service_uuids: vec![COPRESENCE_SERVICE_UUID].into_iter().collect(),
+            service_data: [(COPRESENCE_SERVICE_UUID, header)].into_iter().collect(),
             discoverable: Some(true),
             min_interval: Some(ADV_MIN_INTERVAL),
             max_interval: Some(ADV_MAX_INTERVAL),
