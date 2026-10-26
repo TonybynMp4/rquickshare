@@ -647,6 +647,20 @@ async fn bluetooth_turned_on(adapter: &Adapter) {
     std::future::pending::<()>().await;
 }
 
+/// Whether the Bluetooth radio is on right now. Blocking, so call it from a
+/// blocking thread.
+#[cfg(target_os = "windows")]
+pub(crate) fn bluetooth_is_on() -> bool {
+    use windows::Devices::Bluetooth::BluetoothAdapter;
+    use windows::Devices::Radios::RadioState;
+
+    BluetoothAdapter::GetDefaultAsync()
+        .and_then(|op| op.join())
+        .and_then(|adapter| adapter.GetRadioAsync()?.join())
+        .and_then(|radio| radio.State())
+        .is_ok_and(|state| state == RadioState::On)
+}
+
 /// Resolves when the Bluetooth radio turns on. Like on Linux, it being on
 /// already doesn't count.
 #[cfg(target_os = "windows")]

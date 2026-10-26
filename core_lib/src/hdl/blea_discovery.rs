@@ -16,7 +16,9 @@
 use std::collections::HashMap;
 
 use anyhow::anyhow;
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{
+    Central, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter,
+};
 use btleplug::platform::{Adapter, Manager};
 use futures::stream::StreamExt;
 use tokio::sync::broadcast::Sender;
@@ -480,6 +482,11 @@ impl BleDiscovery {
         // Watch for transfers so we can get off the radio while one runs.
         let mut transfers = TRANSFER_COUNT.subscribe();
         let mut scanning = true;
+        // Bluetooth turned off stops the scan for good; it is started again
+        // when the adapter reports the radio back on.
+        let mut radio_on = true;
+        // Why the loop ended, if not because it was cancelled.
+        let mut failure: Option<anyhow::Error> = None;
         // Peripherals an identification task currently holds open. Aborting a
         // task kills it at an await point, so its own `disconnect` never runs -
         // and a GATT connection we keep open stops the peer being discoverable
@@ -504,7 +511,7 @@ impl BleDiscovery {
                         info!("{INNER_NAME}: transfer in progress, pausing the scan");
                         let _ = self.adapter.stop_scan().await;
                         scanning = false;
-                    } else if !busy && !scanning {
+                    } else if !busy && !scanning && radio_on {
                         info!("{INNER_NAME}: transfers finished, resuming the scan");
                         if let Err(e) = self.adapter.start_scan(ScanFilter::default()).await {
                             warn!("{INNER_NAME}: could not resume scanning: {e}");
@@ -522,7 +529,36 @@ impl BleDiscovery {
                         }
                     }
                 }
-                Some(e) = events.next() => {
+                e = events.next() => {
+                    // An ended stream used to leave this branch dead and the
+                    // scan silently over; say so instead.
+                    let Some(e) = e else {
+                        failure = Some(anyhow!("the Bluetooth adapter stopped reporting events"));
+                        break;
+                    };
+                    if let CentralEvent::StateUpdate(state) = &e {
+                        match state {
+                            CentralState::PoweredOff if radio_on => {
+                                info!("{INNER_NAME}: Bluetooth turned off; scanning again once it is back on");
+                                radio_on = false;
+                                scanning = false;
+                            }
+                            CentralState::PoweredOn if !radio_on => {
+                                radio_on = true;
+                                if *transfers.borrow() == 0 {
+                                    match self.adapter.start_scan(ScanFilter::default()).await {
+                                        Ok(()) => {
+                                            info!("{INNER_NAME}: Bluetooth back on, scanning again");
+                                            scanning = true;
+                                        }
+                                        Err(e) => warn!("{INNER_NAME}: could not scan again: {e}"),
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     let mut advertised: Option<Vec<u8>> = None;
                     let id = match e {
                         CentralEvent::ServiceDataAdvertisement { id, service_data } => {
@@ -676,6 +712,9 @@ impl BleDiscovery {
         if let Ok(mut guard) = BLE_SENDER.lock() {
             *guard = None;
         }
-        Ok(())
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }

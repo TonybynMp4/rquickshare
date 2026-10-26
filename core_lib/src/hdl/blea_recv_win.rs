@@ -18,8 +18,8 @@ use tokio_util::sync::CancellationToken;
 use windows::core::{IInspectable, GUID};
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristicProperties, GattLocalCharacteristic, GattLocalCharacteristicParameters,
-    GattReadRequestedEventArgs, GattServiceProvider, GattServiceProviderAdvertisingParameters,
-    GattWriteOption, GattWriteRequestedEventArgs,
+    GattReadRequestedEventArgs, GattServiceProvider, GattServiceProviderAdvertisementStatus,
+    GattServiceProviderAdvertisingParameters, GattWriteOption, GattWriteRequestedEventArgs,
 };
 use windows::Foundation::TypedEventHandler;
 use windows::Storage::Streams::{DataReader, DataWriter};
@@ -1426,6 +1426,48 @@ impl BleReceiverAdvertiser {
                             last_status,
                             adv_status_name(last_status)
                         );
+
+                        // Turning Bluetooth off aborts the advertisement, and it
+                        // used to stay aborted until the app restarted: the PC
+                        // stopped being discoverable over BLE for good. Aborted
+                        // also shows briefly at every start, so act only when
+                        // the radio really is off: wait for it to come back on,
+                        // then advertise again.
+                        if status == GattServiceProviderAdvertisementStatus::Aborted
+                            && !adv_paused
+                            && !crate::hdl::bluetooth_is_on()
+                        {
+                            info!(
+                                "{INNER_NAME}: Bluetooth turned off; advertising again once it is back on"
+                            );
+                            let back = tokio::runtime::Handle::current().block_on(async {
+                                tokio::select! {
+                                    _ = crate::hdl::bluetooth_turned_on() => true,
+                                    _ = ctk.cancelled() => false,
+                                }
+                            });
+                            if !back {
+                                break;
+                            }
+                            // Windows usually resumes a GATT service's advertisement
+                            // by itself once the radio is back - measured: status 4
+                            // a second after Bluetooth came on - and then refuses a
+                            // second start with E_ILLEGAL_METHOD_CALL. Starting it
+                            // here covers the times it does not.
+                            match provider.StartAdvertisingWithParameters(&params) {
+                                Ok(()) => info!("{INNER_NAME}: Bluetooth back on, advertising again"),
+                                Err(e)
+                                    if e.code()
+                                        == windows::Win32::Foundation::E_ILLEGAL_METHOD_CALL =>
+                                {
+                                    info!(
+                                        "{INNER_NAME}: Bluetooth back on; Windows resumed the advertisement"
+                                    )
+                                }
+                                Err(e) => warn!("{INNER_NAME}: could not advertise again: {e}"),
+                            }
+                            last_status = -1;
+                        }
                     }
                 }
                 // 50ms, not 250ms: this loop now also paces outbound
