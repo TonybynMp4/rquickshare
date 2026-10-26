@@ -430,7 +430,11 @@ impl BleDiscovery {
         // Report each peer once. BLE advertisements repeat several times a
         // second, and a phone using a rotating random address would otherwise
         // pile up duplicates in the UI.
-        let mut seen: HashMap<String, ()> = HashMap::new();
+        // Peers already identified, and 0xFEF3 advertisers whose payload
+        // turned out to be some other copresence service. Neither is looked at
+        // again this session.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut not_sharing: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Publish through this while we run, so `note_lan_peer` can retract a
         // BLE entry the moment mDNS resolves the same device.
@@ -538,7 +542,7 @@ impl BleDiscovery {
                     };
 
                     let address = peripheral.address().to_string();
-                    if seen.insert(address.clone(), ()).is_some() {
+                    if seen.contains(&address) || not_sharing.contains(&address) {
                         continue;
                     }
 
@@ -560,12 +564,21 @@ impl BleDiscovery {
                         .as_deref()
                         .and_then(super::parse_peer_advertisement)
                     else {
-                        debug!(
-                            "{INNER_NAME}: {address} advertises 0xFEF3 but not NearbySharing, \
-                             skipping"
-                        );
+                        // Marking these seen up front lost real peers: a
+                        // UUID-only advertisement has nothing to parse yet, and
+                        // the one carrying the payload was then never looked at.
+                        // Only a payload that is genuinely something else rules
+                        // the device out.
+                        if advertised.is_some() {
+                            debug!(
+                                "{INNER_NAME}: {address} advertises 0xFEF3 but not NearbySharing, \
+                                 skipping"
+                            );
+                            not_sharing.insert(address);
+                        }
                         continue;
                     };
+                    seen.insert(address.clone());
 
                     match p.name {
                         // Full form: the name came with it, so publish straight
