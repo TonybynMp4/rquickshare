@@ -5,14 +5,16 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::watch;
-use tokio::time::{interval_at, Instant};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
 use crate::utils::{device_name, gen_mdns_endpoint_info, gen_mdns_name, DeviceType};
 
 const INNER_NAME: &str = "MDnsServer";
-const TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// How long Temporarily visible lasts before it reverts to Invisible. A real
+/// duration the user chose, not a stand-in for an event.
+const TEMPORARY_VISIBILITY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -110,7 +112,15 @@ impl MDnsServer {
         let monitor = self.daemon.monitor()?;
         let ble_receiver = &mut self.ble_receiver;
         let mut visibility = *self.visibility_receiver.borrow();
-        let mut interval = interval_at(Instant::now() + TICK_INTERVAL, TICK_INTERVAL);
+        // When Temporarily visible runs out; only set while it is on.
+        //
+        // This used to be a 60 s interval that also re-registered the service
+        // every minute while Visible. That is not needed: the daemon answers a
+        // phone that starts browsing later, and the moments a phone is known to
+        // be looking - its BLE "sharing" advertisement, the window opening -
+        // re-announce below.
+        let mut temporary_until =
+            (visibility == Visibility::Temporarily).then(|| Instant::now() + TEMPORARY_VISIBILITY);
 
         if visibility != Visibility::Invisible {
             info!("{INNER_NAME}: initial registration: {visibility:?}");
@@ -133,6 +143,7 @@ impl MDnsServer {
                     visibility = *self.visibility_receiver.borrow_and_update();
 
                     debug!("{INNER_NAME}: visibility changed: {visibility:?}");
+                    temporary_until = None;
                     if visibility == Visibility::Visible {
                         self.daemon.register(self.service_info.clone())?;
                     } else if visibility == Visibility::Invisible {
@@ -140,7 +151,7 @@ impl MDnsServer {
                         let _ = receiver.recv_async().await;
                     } else if visibility == Visibility::Temporarily {
                         self.daemon.register(self.service_info.clone())?;
-                        interval.reset();
+                        temporary_until = Some(Instant::now() + TEMPORARY_VISIBILITY);
                     }
                 }
                 _ = self.device_name_receiver.changed() => {
@@ -197,23 +208,23 @@ impl MDnsServer {
                     debug!("{INNER_NAME}: reannounce_receiver: re-announcing");
                     self.daemon.register(self.service_info.clone())?;
                 },
-                _ = interval.tick() => {
-                    // Temporarily has expired: stop advertising and flip back to
+                _ = tokio::time::sleep_until(temporary_until.unwrap_or_else(Instant::now)),
+                    if temporary_until.is_some() =>
+                {
+                    // Temporarily has run out: stop advertising and flip back to
                     // Invisible.
-                    if visibility == Visibility::Temporarily {
-                        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                        let _ = receiver.recv_async().await;
-                        let _ = self.visibility_sender.lock().unwrap().send(Visibility::Invisible);
-                        continue;
+                    temporary_until = None;
+                    let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
+                    if let Err(e) = receiver.recv_async().await {
+                        debug!("{INNER_NAME}: unregister did not report back: {e}");
                     }
-
-                    // Periodic re-announcement while visible. A device left
-                    // Visible in the tray otherwise announces only once at
-                    // startup, so a peer that starts browsing later never finds
-                    // it until something forces a fresh `register`.
-                    if visibility == Visibility::Visible {
-                        trace!("{INNER_NAME}: periodic re-announce");
-                        self.daemon.register(self.service_info.clone())?;
+                    match self.visibility_sender.lock() {
+                        Ok(sender) => {
+                            if sender.send(Visibility::Invisible).is_err() {
+                                debug!("{INNER_NAME}: nobody is watching visibility any more");
+                            }
+                        }
+                        Err(e) => warn!("{INNER_NAME}: could not end Temporarily visible: {e}"),
                     }
                 }
             }
