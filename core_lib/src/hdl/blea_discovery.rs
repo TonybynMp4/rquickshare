@@ -369,14 +369,8 @@ impl Drop for AdvertisePause {
     }
 }
 
-/// Is a BLE send running right now?
-#[cfg(target_os = "windows")]
-pub fn ble_send_in_progress() -> bool {
-    *BLE_SEND_COUNT.borrow() > 0
-}
-
 /// Follows how many BLE sends are running.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub fn ble_sends() -> tokio::sync::watch::Receiver<usize> {
     BLE_SEND_COUNT.subscribe()
 }
