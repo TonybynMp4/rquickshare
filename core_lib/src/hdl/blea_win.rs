@@ -195,6 +195,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a Bluetooth adapter"]
     async fn advertiser_stops_when_cancelled() {
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let ctk = CancellationToken::new();
         let advertiser = BleAdvertiser::new().await.unwrap();
         let run = tokio::spawn({
@@ -202,9 +203,9 @@ mod tests {
             async move { advertiser.run(ctk).await }
         });
 
-        // Give the publisher a moment on air before cancelling; this test is
-        // about the cancel path, not timing.
-        tokio::task::yield_now().await;
+        // Long enough on air for the publisher to report Started in the log;
+        // what the test checks is the cancel afterwards.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         ctk.cancel();
 
         tokio::time::timeout(std::time::Duration::from_secs(10), run)
