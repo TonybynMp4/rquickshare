@@ -35,6 +35,12 @@ windows = { version = "0.62", features = [
     "Foundation",
     "Foundation_Collections",
     "Win32_System_Com",
+    # NotifyUnicastIpAddressChange: the address the phone's hotspot hands us,
+    # waited for as an event rather than polled.
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
 ], optional = true }
 # AsyncOperationCompletedHandler and the IAsync* types live here since
 # windows 0.59; `windows` uses them but doesn't re-export the handler.
