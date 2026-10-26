@@ -76,7 +76,15 @@ impl BleReceiverAdvertiser {
     pub async fn run(&self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         let session = bluer::Session::new().await?;
         let adapter = session.default_adapter().await?;
-        adapter.set_powered(true).await?;
+        // Leave Bluetooth off if the user turned it off; this used to power the
+        // adapter on at startup. Serve once they turn it on.
+        if !adapter.is_powered().await? {
+            info!("{INNER_NAME}: Bluetooth is off; waiting for it to be turned on");
+            tokio::select! {
+                _ = ctk.cancelled() => return Ok(()),
+                _ = crate::hdl::bluetooth_turned_on(&session) => {}
+            }
+        }
         info!(
             "{INNER_NAME}: advertising on Bluetooth adapter {} ({})",
             adapter.name(),

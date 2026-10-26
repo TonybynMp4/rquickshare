@@ -9,7 +9,6 @@ use crate::utils::RemoteDeviceInfo;
 
 #[derive(Debug, Default)]
 pub struct InternalFileInfo {
-    pub payload_id: i64,
     /// Inbound: the sanitized name the file is saved under (before any 1_
     /// prefix), and its slot in `saved_files`. Unused outbound.
     pub name: String,

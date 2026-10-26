@@ -1,6 +1,6 @@
 {
   "identifier": "migrated",
-  "description": "permissions that were migrated from v1",
+  "description": "What the webview may call. Kept to the calls the front end makes; received files are opened through the app's own open_received / reveal_received commands, not the opener plugin.",
   "local": true,
   "windows": [
     "main"
@@ -11,31 +11,18 @@
     "core:window:default",
     "core:app:default",
     "core:resources:default",
-    "core:menu:default",
-    "core:tray:default",
-    "store:default",
-    "dialog:default",
-    "notification:default",
+    "store:allow-get-store",
     "store:allow-get",
     "store:allow-has",
     "store:allow-set",
     "store:allow-save",
+    "notification:default",
     "autostart:allow-enable",
     "autostart:allow-disable",
-    "autostart:allow-is-enabled",
     "dialog:allow-open",
     "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text",
     "opener:allow-open-url",
-    "opener:allow-default-urls",
-    {
-      "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "**" }]
-    },
-    {
-      "identifier": "opener:allow-reveal-item-in-dir",
-      "allow": [{ "path": "**" }]
-    },
-    "store:default"
+    "opener:allow-default-urls"
   ]
 }

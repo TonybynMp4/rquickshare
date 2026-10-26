@@ -12,6 +12,8 @@ mod get_hostname;
 pub use get_hostname::*;
 mod nearby_alerts;
 pub use nearby_alerts::*;
+mod received;
+pub use received::*;
 mod send_payload;
 pub use send_payload::*;
 mod send_to_rs;

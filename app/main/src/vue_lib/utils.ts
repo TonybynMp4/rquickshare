@@ -206,10 +206,6 @@ async function sendCmd(vm: TauriVM, id: string, action: ChannelAction) {
 	await vm.invoke('send_to_rs', { message: cm });
 }
 
-function blured() {
-	(document.activeElement as any).blur();
-}
-
 function getProgress(item: DisplayedItem): string {
 	const value = item.ack_bytes! / item.total_bytes! * 100;
 	return `--progress: ${value}`;
@@ -298,7 +294,6 @@ export const utils = {
 	removeRequest,
 	sendInfo,
 	sendCmd,
-	blured,
 	getProgress,
 	setDownloadPath,
 	getDownloadPath,

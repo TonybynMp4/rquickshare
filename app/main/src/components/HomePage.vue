@@ -205,8 +205,7 @@ import { getStore } from "@tauri-apps/plugin-store";
 import { isPermissionGranted, requestPermission } from '@tauri-apps/plugin-notification';
 import { disable, enable } from '@tauri-apps/plugin-autostart';
 import { open as tauriDialog } from '@tauri-apps/plugin-dialog';
-import { openUrl as openExternalUrl, openPath, revealItemInDir } from '@tauri-apps/plugin-opener';
-import { join } from '@tauri-apps/api/path';
+import { openUrl as openExternalUrl } from '@tauri-apps/plugin-opener';
 import { writeText, readText } from '@tauri-apps/plugin-clipboard-manager';
 
 import { ChannelMessage } from '@martichou/core_lib/bindings/ChannelMessage';
@@ -280,7 +279,6 @@ export default {
 			// Endpoint ids we've asked the backend to send to and not yet heard
 			// back about. Same purpose as `responding`, for the outbound side.
 			sending: ref<Set<string>>(new Set()),
-			sendWatchdogs: new Map<string, number>(),
 
 			unlisten: Array<UnlistenFn>(),
 
@@ -356,7 +354,7 @@ export default {
 					// states aren't displayed, so waiting for one of those would
 					// blank the card out mid-connect.
 					if (cm.state && this.stateToDisplay.includes(cm.state)) {
-						this.clearSendWatchdog(cm.id);
+						this.sending.delete(cm.id);
 					}
 
 					// TODO - Automatically open || copy to clipboard + toast
@@ -458,9 +456,11 @@ export default {
 			window.addEventListener('keydown', onPaste);
 			this.unlisten.push(() => window.removeEventListener('keydown', onPaste));
 
-			// Optional clipboard auto-sync: when enabled, auto-stage new
-			// clipboard text while idle so you only have to pick a device.
-			const clipboardTimer = window.setInterval(async () => {
+			// Optional clipboard auto-sync: when enabled, stage newly copied text
+			// so you only have to pick a device. Checked when the window gains
+			// focus - the moment someone who just copied something elsewhere
+			// comes back to send it - rather than by polling the clipboard.
+			const stageClipboard = async () => {
 				if (!this.clipboardAutosync) return;
 				if (this.outboundPayload !== undefined) return;
 
@@ -477,8 +477,10 @@ export default {
 				this.outboundPayload = { Text: text } as OutboundPayload;
 				await this.startDiscovery();
 				this.toastStore.addToast("Clipboard text staged to send - pick a device", ToastType.Success);
-			}, 1500);
-			this.unlisten.push(() => window.clearInterval(clipboardTimer));
+			};
+			this.unlisten.push(await getCurrentWindow().onFocusChanged(async ({ payload: focused }) => {
+				if (focused) await stageClipboard();
+			}));
 
 			await this.getLatestVersion(this);
 		});
@@ -514,10 +516,16 @@ export default {
 		// writer - children ask for discovery by emitting, they don't reach into
 		// the shared vm to set it.
 		startDiscovery: async function() {
-			if (!this.discoveryRunning) {
-				this.qrSvg = await invoke<string>('start_discovery');
-			}
+			if (this.discoveryRunning) return;
+			// Set before the await: a paste and a drop in quick succession
+			// otherwise both saw it false and started discovery twice.
 			this.discoveryRunning = true;
+			try {
+				this.qrSvg = await invoke<string>('start_discovery');
+			} catch (e) {
+				this.discoveryRunning = false;
+				throw e;
+			}
 		},
 		pluralize: function(n: number, noun: string): string {
 			return `${n} ${n === 1 ? noun : `${noun}s`}`;
@@ -534,18 +542,8 @@ export default {
 		// Cancelling the whole send drops the staged payload and the device list,
 		// so any spinner still up belongs to a device that is about to vanish.
 		stopSending: async function() {
-			for (const id of Array.from(this.sendWatchdogs.keys())) {
-				this.clearSendWatchdog(id);
-			}
+			this.sending.clear();
 			await this.clearSending(this);
-		},
-		clearSendWatchdog: function(id: string) {
-			const timer = this.sendWatchdogs.get(id);
-			if (timer !== undefined) {
-				window.clearTimeout(timer);
-				this.sendWatchdogs.delete(id);
-			}
-			this.sending.delete(id);
 		},
 		// Clicking a device only queues the transfer; the backend then has to
 		// connect and get through the handshake before anything about it is
@@ -556,20 +554,13 @@ export default {
 			if (this.sending.has(id)) return;
 			this.sending.add(id);
 
-			// The backend reports every failure it can, but it can't report a
-			// hang. Rather than stranding the card on a spinner with no way back,
-			// give up after two minutes - comfortably longer than the slowest
-			// BLE connect we've measured.
-			this.sendWatchdogs.set(id, window.setTimeout(() => {
-				if (!this.sending.has(id)) return;
-				this.clearSendWatchdog(id);
-				this.toastStore.addToast("No answer from that device - try again", ToastType.Error);
-			}, 120_000));
-
+			// The spinner ends with the transfer's first displayable state, or
+			// with Disconnected, which the backend sends when it cannot connect.
+			// Cancel clears it too.
 			try {
 				await this.sendInfo(this, id);
 			} catch (e) {
-				this.clearSendWatchdog(id);
+				this.sending.delete(id);
 				// A rejected Tauri command surfaces its `Err(String)` as a raw
 				// string, not an Error, so handle both before falling back.
 				let msg = "Could not start the transfer";
@@ -607,46 +598,32 @@ export default {
 				console.error("Error opening URL", e);
 			}
 		},
-		// "Open" on a received transfer. `destination` is the download *folder*,
-		// so opening it alone only ever showed the folder. With a single file we
-		// can open the file itself, which is what the button implies; for a
-		// multi-file transfer there's no one file to open, so fall back to the
-		// folder. A shared URL payload is a web link and goes to openUrl.
+		// "Open" on a received transfer. A shared URL payload is a web link and
+		// goes to openUrl. Files go through the backend, which knows what this
+		// transfer saved: it opens a single file, shows several in their
+		// folder, and shows rather than runs anything executable, since the
+		// sender could be anyone nearby.
 		openTransfer: async function(item: DisplayedItem) {
 			if (item.text_type === 'Url' && item.text_payload) {
 				await this.openUrl(item.text_payload);
 				return;
 			}
 
-			if (!item.destination) return;
-
 			try {
-				const files = item.files ?? [];
-				const target = files.length === 1
-					? await join(item.destination, files[0])
-					: item.destination;
-				await openPath(target);
+				const outcome = await invoke<string>('open_received', { id: item.id });
+				if (outcome === 'revealed' && (item.files ?? []).length === 1) {
+					this.toastStore.addToast("This file could run code, so it's shown in its folder instead", ToastType.Info);
+				}
 			} catch (e) {
 				this.toastStore.addToast("Could not open the received file", ToastType.Error);
 				console.error("Error opening transfer", e);
 			}
 		},
-		// "Open folder" on a received transfer. Reveal the received files so the
-		// file manager selects them (`files` holds the saved names once
-		// finished); if that fails, open the folder.
+		// "Open folder" on a received transfer: its files, selected in the file
+		// manager.
 		openFolder: async function(item: DisplayedItem) {
-			const destination = item.destination;
-			if (!destination) return;
-
 			try {
-				try {
-					const paths = await Promise.all((item.files ?? []).map((f) => join(destination, f)));
-					await revealItemInDir(paths);
-					return;
-				} catch (e) {
-					console.warn("Could not reveal the received files, opening their folder", e);
-				}
-				await openPath(destination);
+				await invoke('reveal_received', { id: item.id });
 			} catch (e) {
 				this.toastStore.addToast("Could not open the download folder", ToastType.Error);
 				console.error("Error opening folder", e);

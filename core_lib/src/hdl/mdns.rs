@@ -82,6 +82,31 @@ impl MDnsServer {
 
     pub async fn run(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
+        let served = self.serve(ctk).await;
+
+        // However serving ended - cancelled, or an error from the daemon -
+        // take the record down and stop the daemon, or its thread is orphaned.
+        match self.daemon.unregister(self.service_info.get_fullname()) {
+            Ok(receiver) => {
+                if let Ok(event) = receiver.recv_async().await {
+                    info!("MDnsServer: service unregistered: {event:?}");
+                }
+            }
+            Err(e) => warn!("MDnsServer: could not unregister: {e}"),
+        }
+
+        // Shut the daemon down so its background thread stops cleanly instead
+        // of being orphaned, which otherwise floods the log with
+        // "sending on a closed channel" errors. Await the shutdown response so
+        // the daemon doesn't log a "failed to send response of shutdown" error.
+        if let Ok(receiver) = self.daemon.shutdown() {
+            let _ = receiver.recv_async().await;
+        }
+
+        served
+    }
+
+    async fn serve(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         let monitor = self.daemon.monitor()?;
         let ble_receiver = &mut self.ble_receiver;
         let mut visibility = *self.visibility_receiver.borrow();
@@ -112,7 +137,7 @@ impl MDnsServer {
                         self.daemon.register(self.service_info.clone())?;
                     } else if visibility == Visibility::Invisible {
                         let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                        let _ = receiver.recv();
+                        let _ = receiver.recv_async().await;
                     } else if visibility == Visibility::Temporarily {
                         self.daemon.register(self.service_info.clone())?;
                         interval.reset();
@@ -177,7 +202,7 @@ impl MDnsServer {
                     // Invisible.
                     if visibility == Visibility::Temporarily {
                         let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                        let _ = receiver.recv();
+                        let _ = receiver.recv_async().await;
                         let _ = self.visibility_sender.lock().unwrap().send(Visibility::Invisible);
                         continue;
                     }
@@ -192,20 +217,6 @@ impl MDnsServer {
                     }
                 }
             }
-        }
-
-        // Unregister the mDNS service - we're shutting down
-        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-        if let Ok(event) = receiver.recv() {
-            info!("MDnsServer: service unregistered: {event:?}");
-        }
-
-        // Shut the daemon down so its background thread stops cleanly instead
-        // of being orphaned, which otherwise floods the log with
-        // "sending on a closed channel" errors. Await the shutdown response so
-        // the daemon doesn't log a "failed to send response of shutdown" error.
-        if let Ok(receiver) = self.daemon.shutdown() {
-            let _ = receiver.recv_async().await;
         }
 
         Ok(())

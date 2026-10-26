@@ -74,7 +74,6 @@ use crate::{location_nearby_connections, sharing_nearby};
 type HmacSha256 = Hmac<Sha256>;
 
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
-const SANITY_DURATION: Duration = Duration::from_micros(10);
 
 /// Generic over the transport so the handshake can be driven by a test over an
 /// in-memory duplex pair, not just a real socket. In production `S` is always
@@ -116,9 +115,6 @@ pub struct InboundRequest<S> {
         any(target_os = "linux", target_os = "windows")
     ))]
     switch_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
-    /// When we last answered a KeepAlive, so redundant responses can be skipped.
-    /// Not transport-specific, but it matters on BLE: see the KeepAlive arm.
-    last_keepalive_response: Option<std::time::Instant>,
     /// When we last broadcast a receive-progress update. A per-chunk broadcast
     /// floods the shared ChannelMessage bus - thousands of messages during a
     /// fast transfer - overflowing its 50-slot buffer so this handler's own
@@ -176,7 +172,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             wifi_direct: None,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             wifi_direct_creds: None,
-            last_keepalive_response: None,
             last_progress_broadcast: None,
             prof_decrypt: std::time::Duration::ZERO,
             prof_aes: std::time::Duration::ZERO,
@@ -543,7 +538,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         self.update_state(
             |e| {
                 e.private_key = Some(secret_key);
-                e.public_key = Some(public_key);
                 e.server_init_data = Some(server_init_data.clone());
             },
             false,
@@ -1737,8 +1731,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                 // backlog to clear - the indications were confirming one at a
                 // time with `0 still queued`. Don't retry this.
                 trace!("Sending keepalive");
-                self.last_keepalive_response = Some(std::time::Instant::now());
-                self.send_keepalive(true).await?;
+                self.send_keepalive().await?;
             }
             location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
                 info!(
@@ -2025,7 +2018,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
                 self.state.saved_files.push(name.clone());
 
                 let info = InternalFileInfo {
-                    payload_id: file.payload_id(),
                     name: name.clone(),
                     saved_index: self.state.saved_files.len() - 1,
                     file_url: std::path::PathBuf::new(),
@@ -2200,6 +2192,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
 
             let (path, file) = create_unique_file(&dir, &mfi.name)?;
             info!("Created file: {path:?}");
+            #[cfg(target_os = "windows")]
+            crate::utils::mark_as_downloaded(&path);
             if let Some(saved) = path.file_name() {
                 self.state.saved_files[mfi.saved_index] = saved.to_string_lossy().into_owned();
             }
@@ -2506,12 +2500,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
         Ok(())
     }
 
-    async fn send_keepalive(&mut self, ack: bool) -> Result<(), anyhow::Error> {
+    /// Answer a KeepAlive.
+    async fn send_keepalive(&mut self) -> Result<(), anyhow::Error> {
         let ack_frame = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
                 r#type: Some(location_nearby_connections::v1_frame::FrameType::KeepAlive.into()),
-                keep_alive: Some(KeepAliveFrame { ack: Some(ack) }),
+                keep_alive: Some(KeepAliveFrame { ack: Some(true) }),
                 ..Default::default()
             }),
         };
@@ -2587,10 +2582,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> InboundRequest<S> {
             meta: self.state.transfer_metadata.clone(),
             ..Default::default()
         });
-        // Add a small sleep timer to allow the Tokio runtime to have
-        // some spare time to process channel's message. Otherwise it
-        // get spammed by new requests. Currently set to 10 micro secs.
-        tokio::time::sleep(SANITY_DURATION).await;
+        // Let the receivers run before the next update. This was a 10us sleep,
+        // which tokio rounds up to a whole millisecond per update; yielding
+        // hands the turn over without a timer.
+        tokio::task::yield_now().await;
     }
 }
 

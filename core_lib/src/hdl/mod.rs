@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use p256::{PublicKey, SecretKey};
+use p256::SecretKey;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -191,7 +191,6 @@ pub struct InnerState {
     // Everything needed for encryption/decryption/verif
     pub cipher_commitment: Option<CipherCommitment>,
     pub private_key: Option<SecretKey>,
-    pub public_key: Option<PublicKey>,
     pub server_init_data: Option<Vec<u8>>,
     pub client_init_msg_data: Option<Vec<u8>>,
     pub ukey_client_finish_msg_data: Option<Vec<u8>>,
@@ -204,9 +203,6 @@ pub struct InnerState {
     pub text_payload: Option<TextPayloadInfo>,
     // Used to handle egress text transfer: (payload_id, text bytes)
     pub outbound_text: Option<(i64, Vec<u8>)>,
-    // pub text_payload_id: i64,
-    // pub text_is_url: bool,
-    // pub wifi_ssid: Option<String>,
     pub payload_buffers: HashMap<i64, Vec<u8>>,
 }
 

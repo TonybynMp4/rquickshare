@@ -1,6 +1,11 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 
+// Bundled rather than fetched from Google Fonts, so launching the app makes no
+// third-party request and the font is there offline. 400 is body text, 500 is
+// `font-medium`; nothing uses another weight.
+import '@fontsource/montserrat/400.css'
+import '@fontsource/montserrat/500.css'
 import './vue_lib/assets/main.css'
 
 import App from './App.vue'

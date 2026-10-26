@@ -50,7 +50,6 @@ use crate::{location_nearby_connections, sharing_nearby};
 type HmacSha256 = Hmac<Sha256>;
 
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
-const SANITY_DURATION: Duration = Duration::from_micros(10);
 /// How long to wait, once everything is sent, for the receiver to hang up.
 ///
 /// The receiver ends the session itself once it has written every payload.
@@ -687,7 +686,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             |e| {
                 e.state = State::SentUkeyClientInit;
                 e.private_key = Some(secret_key);
-                e.public_key = Some(public_key);
                 e.client_init_msg_data = Some(frame.encode_to_vec());
                 e.ukey_client_finish_msg_data = Some(finish_frame.encode_to_vec());
             },
@@ -894,7 +892,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             }
             location_nearby_connections::v1_frame::FrameType::KeepAlive => {
                 trace!("Sending keepalive");
-                self.send_keepalive(true).await?;
+                self.send_keepalive().await?;
             }
             location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeRetry => {
                 info!(
@@ -970,11 +968,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     if send_wifi_upgrade_enabled() {
                         let lan = info.wifi_lan_socket.as_ref().and_then(|s| {
                             let ip = s.ip_address();
-                            (ip.len() == 4 && s.wifi_port.is_some()).then(|| {
-                                (
-                                    std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
-                                    s.wifi_port() as u16,
-                                )
+                            // A port that doesn't fit is a bad offer, not one
+                            // to wrap round to some other port.
+                            let port = u16::try_from(s.wifi_port?).ok()?;
+                            (ip.len() == 4).then(|| {
+                                (std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]), port)
                             })
                         });
                         if let Some((ip, port)) = lan {
@@ -1197,26 +1195,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         match &self.payload {
             OutboundPayload::Files(files) => {
                 for f in files {
+                    // A file that can't be sent fails the transfer. Skipping it
+                    // used to send the rest and report Finished, so the user
+                    // was told everything went when some of it never left.
                     let path = Path::new(f);
                     if !path.is_file() {
-                        warn!("Path is not a file: {}", f);
-                        continue;
+                        return Err(anyhow!("can't send {f}: it is not a file"));
                     }
 
-                    let file = match File::open(f) {
-                        Ok(_f) => _f,
-                        Err(e) => {
-                            error!("Failed to open file: {f}: {:?}", e);
-                            continue;
-                        }
-                    };
-                    let fmetadata = match file.metadata() {
-                        Ok(_fm) => _fm,
-                        Err(e) => {
-                            error!("Failed to get metadata for: {f}: {:?}", e);
-                            continue;
-                        }
-                    };
+                    let file = File::open(f).map_err(|e| anyhow!("can't open {f}: {e}"))?;
+                    let fmetadata = file
+                        .metadata()
+                        .map_err(|e| anyhow!("can't read the size of {f}: {e}"))?;
 
                     let ftype = mime_guess::from_path(path)
                         .first_or_octet_stream()
@@ -1255,7 +1245,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     transferred_files.insert(
                         fmeta.payload_id(),
                         InternalFileInfo {
-                            payload_id: fmeta.payload_id(),
                             file_url: path.to_path_buf(),
                             bytes_transferred: 0,
                             total_size: fmeta.size(),
@@ -1521,12 +1510,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                                 break;
                             }
 
-                            let mut buffer = vec![0u8; self.chunk_size];
+                            // Read no further than the size the peer was told:
+                            // a file that grew since then is sent as it was
+                            // announced. One that shrank would otherwise read 0
+                            // bytes forever and never reach `total_size`.
+                            let remaining = curr_state.total_size - curr_state.bytes_transferred;
+                            let want = remaining.min(self.chunk_size as i64) as usize;
+                            let mut buffer = vec![0u8; want];
                             let bytes_read = curr_state.file.as_ref().unwrap().read(&mut buffer)?;
+                            if bytes_read == 0 {
+                                return Err(anyhow!(
+                                    "{:?} shrank while sending: {} of {} bytes read",
+                                    curr_state.file_url,
+                                    curr_state.bytes_transferred,
+                                    curr_state.total_size
+                                ));
+                            }
 
                             (
                                 InternalFileInfo {
-                                    payload_id: curr_state.payload_id,
                                     file_url: curr_state.file_url.clone(),
                                     bytes_transferred: curr_state.bytes_transferred,
                                     total_size: curr_state.total_size,
@@ -1993,10 +1995,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             warn!("Bandwidth upgrade: peer offered a hotspot with no credentials");
             return;
         };
+        let Ok(port) = u16::try_from(creds.port()) else {
+            warn!(
+                "Bandwidth upgrade: peer offered a hotspot on port {}",
+                creds.port()
+            );
+            return;
+        };
         self.join_started = true;
         self.joined_ap = true;
         let gateway = creds.gateway().to_string();
-        let port = creds.port() as u16;
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
         let ready = self.join_ready.clone();
 
@@ -2267,12 +2275,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         Ok(())
     }
 
-    async fn send_keepalive(&mut self, ack: bool) -> Result<(), anyhow::Error> {
+    /// Answer a KeepAlive.
+    async fn send_keepalive(&mut self) -> Result<(), anyhow::Error> {
         let ack_frame = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
                 r#type: Some(location_nearby_connections::v1_frame::FrameType::KeepAlive.into()),
-                keep_alive: Some(KeepAliveFrame { ack: Some(ack) }),
+                keep_alive: Some(KeepAliveFrame { ack: Some(true) }),
                 ..Default::default()
             }),
         };
@@ -2357,9 +2366,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             meta: self.state.transfer_metadata.clone(),
             ..Default::default()
         });
-        // Add a small sleep timer to allow the Tokio runtime to have
-        // some spare time to process channel's message. Otherwise it
-        // get spammed by new requests. Currently set to 10 micro secs.
-        tokio::time::sleep(SANITY_DURATION).await;
+        // Let the receivers run before the next update. This was a 10us sleep,
+        // which tokio rounds up to a whole millisecond per update; yielding
+        // hands the turn over without a timer.
+        tokio::task::yield_now().await;
     }
 }

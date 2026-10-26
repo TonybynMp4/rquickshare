@@ -112,15 +112,23 @@ fn service_id_hash() -> Vec<u8> {
 /// Full endpoint info: bitfield, 16 bytes salt + metadata key, then the
 /// length-prefixed UTF-8 device name. Visibility bit clear = visible/Everyone,
 /// matching what `gen_mdns_endpoint_info` emits over mDNS.
+///
+/// The advertisement puts this whole block behind one length byte, so the name
+/// only gets what is left after the 18 bytes in front of it, cut on a char
+/// boundary so it stays valid UTF-8.
 fn build_endpoint_info_full(device_type: u8, name: &str) -> Vec<u8> {
+    const MAX_NAME_LEN: usize = u8::MAX as usize - 18;
+    let mut len = name.len().min(MAX_NAME_LEN);
+    while !name.is_char_boundary(len) {
+        len -= 1;
+    }
+
     let mut info = Vec::new();
     info.push(device_type << 1);
     let salt_and_meta: [u8; 16] = rand::random();
     info.extend_from_slice(&salt_and_meta);
-    let name_bytes = name.as_bytes();
-    let len = name_bytes.len().min(255);
     info.push(len as u8);
-    info.extend_from_slice(&name_bytes[..len]);
+    info.extend_from_slice(&name.as_bytes()[..len]);
     info
 }
 
@@ -302,6 +310,19 @@ mod tests {
         for n in 0..adv.len() {
             let _ = parse_full_advertisement(&adv[..n]);
         }
+    }
+
+    #[test]
+    fn a_long_name_still_fits_the_length_byte() {
+        // 3-byte characters, so the cut has to land between them.
+        let name = "名".repeat(200);
+        let info = build_endpoint_info_full(3, &name);
+        assert!(info.len() <= u8::MAX as usize);
+        assert!(std::str::from_utf8(&info[18..]).is_ok());
+
+        let adv = build_full_receiver_advertisement(&[1, 2, 3, 4], 3, &name);
+        let (parsed, _) = parse_full_advertisement(&adv).expect("parses");
+        assert!(name.starts_with(&parsed));
     }
 
     #[test]
