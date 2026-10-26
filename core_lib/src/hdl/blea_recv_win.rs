@@ -19,6 +19,7 @@ use windows::core::{IInspectable, GUID};
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
     GattCharacteristicProperties, GattLocalCharacteristic, GattLocalCharacteristicParameters,
     GattReadRequestedEventArgs, GattServiceProvider, GattServiceProviderAdvertisementStatus,
+    GattServiceProviderAdvertisementStatusChangedEventArgs,
     GattServiceProviderAdvertisingParameters, GattWriteOption, GattWriteRequestedEventArgs,
 };
 use windows::Foundation::TypedEventHandler;
@@ -67,12 +68,14 @@ const BLE_SOCKET_SERVER_TX_GUID: GUID = GUID::from_u128(0x0000_0100_0004_1000_80
 /// through - and why the phone's later retry always worked.
 ///
 /// The same 5 bytes are re-sent, keeping the Weave counter the phone never saw.
-/// Bounded: this recovers from a transient, it does not spin.
+/// Retries end with the session: once a newer one has replaced it, or its phone
+/// has unsubscribed - the phone dropping the link is what ends a failed one.
 fn notify_confirm(
     confirm_tx: GattLocalCharacteristic,
     confirm: [u8; 5],
-    attempts_left: u32,
     device: String,
+    active: std::sync::Arc<std::sync::Mutex<ActivePeer>>,
+    generation: u64,
 ) {
     let buffer = match (|| {
         let w = DataWriter::new()?;
@@ -90,26 +93,27 @@ fn notify_confirm(
     let device_for_cb = device.clone();
     let sent = notify_device(&confirm_tx, &buffer, Some(&device), move |statuses| {
         let delivered = !statuses.is_empty() && statuses.iter().all(|s| *s == 0);
+        let current = active
+            .lock()
+            .is_ok_and(|a| a.generation() == Some(generation));
         if delivered {
             info!(
                 "*** {INNER_NAME}: ConnectionConfirm delivery statuses {statuses:?} \
                  (0 = Success) ***"
             );
-        } else if attempts_left > 0 {
-            warn!(
-                "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}); \
-                 retrying, {attempts_left} attempt(s) left ***"
-            );
+        } else if current && subscribed_client(&tx_for_cb, &device_for_cb).is_some() {
+            warn!("*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}); retrying ***");
             notify_confirm(
                 tx_for_cb.clone(),
                 confirm,
-                attempts_left - 1,
                 device_for_cb.clone(),
+                active.clone(),
+                generation,
             );
         } else {
             warn!(
-                "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}) and \
-                 no retries left; the peer will drop the link ***"
+                "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}) and the \
+                 session is over; not retrying ***"
             );
         }
     });
@@ -258,9 +262,9 @@ impl BleReceiverAdvertiser {
         let inbound_slot: std::sync::Arc<
             std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let down_slot: std::sync::Arc<
-            std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        // Cancelled when the current session's phone drops the link.
+        let down_slot: std::sync::Arc<std::sync::Mutex<Option<CancellationToken>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
         let handler_inbound = inbound_slot.clone();
         let handler_down = down_slot.clone();
         // The device the current session belongs to, and that session's
@@ -341,6 +345,25 @@ impl BleReceiverAdvertiser {
         let recycle_adv = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let session_recycle = recycle_adv.clone();
 
+        // Wakes the thread that owns the GATT objects whenever something it
+        // acts on may have changed: an indication completed, a session ended,
+        // the advertisement status or the subscribers changed, or a session
+        // moved to its upgraded socket. It acts on the current state each time,
+        // so a wake that finds nothing to do costs nothing.
+        let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let session_wake = wake_tx.clone();
+
+        // The generation of a session that has handed its stream to the
+        // upgraded socket. Its remaining Weave packets go out without waiting
+        // on each other's confirmations: once the phone has joined the new
+        // network it stops confirming BLE indications, and the multiplex
+        // channel close queued behind an unconfirmed one would reach it far too
+        // late. 0 = none; generations start at 1.
+        let flush_generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let session_flush = flush_generation.clone();
+
+        let session_ctk = ctk.clone();
+
         // Supervisor: build a fresh session for every Weave connection.
         tokio::spawn(async move {
             while let Some(generation) = new_session_rx.recv().await {
@@ -349,7 +372,7 @@ impl BleReceiverAdvertiser {
 
                 let (inbound_tx, mut inbound_rx) =
                     tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                let link_down = CancellationToken::new();
                 let (upgrade_tx, mut upgrade_rx) =
                     tokio::sync::mpsc::unbounded_channel::<tokio::net::TcpStream>();
                 let (switch_tx, mut switch_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -362,7 +385,7 @@ impl BleReceiverAdvertiser {
                     *slot = Some(inbound_tx);
                 }
                 if let Ok(mut slot) = down_slot.lock() {
-                    *slot = Some(down_tx);
+                    *slot = Some(link_down.clone());
                 }
 
                 let outbound_tx = session_outbound_tx.clone();
@@ -375,6 +398,12 @@ impl BleReceiverAdvertiser {
                 // The session task waits for its own last frames to be confirmed
                 // before releasing the link - see the recycle below.
                 let end_outstanding = pump_outstanding.clone();
+                let end_link_down = link_down.clone();
+                let end_wake = session_wake.clone();
+                let end_ctk = session_ctk.clone();
+                let pump_wake = session_wake.clone();
+                let pump_flush = session_flush.clone();
+                let pump_ctk = session_ctk.clone();
 
                 tokio::spawn(async move {
                     // Off the radio while we receive: a concurrent BLE scan starves the
@@ -434,19 +463,17 @@ impl BleReceiverAdvertiser {
                     // the clock - it releases the link as soon as the peer has really
                     // caught up, and waits longer than 5s if this link is slow.
                     //
-                    // The 10s bound only stops us hanging if the sender never drains; it
-                    // does not choose a different course.
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        end_outstanding.drained(),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        warn!(
-                            "{INNER_NAME}: {} packet(s) still unconfirmed at the end of the session",
+                    // Every indication ends in a completion, confirmed or failed at
+                    // the stack's own ATT timeout, so this resolves without a clock of
+                    // ours. A dropped link ends it at once: nothing more will be
+                    // confirmed there.
+                    tokio::select! {
+                        _ = end_outstanding.drained() => {}
+                        _ = end_link_down.cancelled() => info!(
+                            "{INNER_NAME}: the link dropped with {} packet(s) unconfirmed",
                             end_outstanding.count()
-                        );
+                        ),
+                        _ = end_ctk.cancelled() => {}
                     }
                     // Free the server for the next device, unless a newer
                     // session already took it.
@@ -460,11 +487,15 @@ impl BleReceiverAdvertiser {
                     // recycling then dropped the retry's link.
                     if current {
                         end_recycle.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if end_wake.send(()).is_err() {
+                            debug!("{INNER_NAME}: the advertiser has stopped");
+                        }
                     }
                 });
 
                 // Pump: reassembled Weave messages in, framed replies out.
                 tokio::spawn(async move {
+                    use futures::FutureExt;
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let mut pending = Vec::new();
                     // Throughput accounting. Lives here rather than in the WinRT write
@@ -601,16 +632,18 @@ impl BleReceiverAdvertiser {
                                         // and SAFE_TO_CLOSE was left unsent in the
                                         // duplex. The peer then waited forever for a
                                         // frame we still held.
+                                        //
+                                        // InboundRequest finishes writing SAFE_TO_CLOSE
+                                        // into the duplex before it signals, so the bytes
+                                        // are already there: take what is readable now
+                                        // and stop at the first read that would wait.
                                         loop {
                                             let mut buf = [0u8; 8192];
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_millis(200),
-                                                ours.read(&mut buf),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                                                Ok(Ok(n)) => pending.extend_from_slice(&buf[..n]),
+                                            match ours.read(&mut buf).now_or_never() {
+                                                Some(Ok(n)) if n > 0 => {
+                                                    pending.extend_from_slice(&buf[..n])
+                                                }
+                                                _ => break,
                                             }
                                         }
                                         while pending.len() >= 4 {
@@ -669,42 +702,30 @@ impl BleReceiverAdvertiser {
                                             );
                                         }
 
-                                        // Then wait for it to actually reach the peer.
-                                        // It is only queued at this point, and on a
-                                        // congested BLE link that is tens of seconds
-                                        // apart - the peer will not use the new socket
-                                        // until it has it.
-
-                                        // Give it a moment to go out, but do not wait on
-                                        // confirmation.
+                                        // Then wait for it to go out, but not for it to
+                                        // be *confirmed*.
                                         //
-                                        // Waiting for the indication to be *confirmed*
-                                        // stalls forever on the LAN path: once the peer
-                                        // has the new socket it stops servicing BLE, so
-                                        // that confirmation may never come. It is also
-                                        // unnecessary - the sender thread drains its
-                                        // queue independently of this pump, so once
-                                        // SAFE_TO_CLOSE is queued it goes out whether we
-                                        // are still here or not. Queueing it was the
-                                        // part that was actually missing.
-                                        //
-                                        // Wait on the drained signal, not a tick. The
-                                        // 3s bound is a safety net only - if the sender
-                                        // never drains we proceed anyway rather than
-                                        // hang, and it never selects a different
-                                        // strategy.
-                                        if tokio::time::timeout(
-                                            std::time::Duration::from_secs(3),
-                                            pump_outstanding.drained(),
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            debug!("{INNER_NAME}: the prior channel did not drain within 3s");
+                                        // Waiting for confirmation stalls forever on the
+                                        // LAN path: once the peer has the new socket it
+                                        // stops servicing BLE, so that confirmation may
+                                        // never come. So the sender stops waiting on
+                                        // confirmations for this session and hands the
+                                        // rest of its queue to the stack, counting each
+                                        // packet off as it goes; `drained` then means
+                                        // "out of our hands". A dropped link ends the
+                                        // wait too: nothing more goes out there.
+                                        pump_flush.store(generation, std::sync::atomic::Ordering::Relaxed);
+                                        if pump_wake.send(()).is_err() {
+                                            debug!("{INNER_NAME}: the advertiser has stopped");
+                                        }
+                                        tokio::select! {
+                                            _ = pump_outstanding.drained() => {}
+                                            _ = link_down.cancelled() => {}
+                                            _ = pump_ctk.cancelled() => break,
                                         }
                                         info!(
                                             "{INNER_NAME}: prior channel released ({} packet(s) still \
-                                             queued, the sender thread will finish them)",
+                                             queued)",
                                             pump_outstanding.count()
                                         );
 
@@ -718,47 +739,19 @@ impl BleReceiverAdvertiser {
                                             "{INNER_NAME}: switching the stream onto the upgraded socket"
                                         );
 
-                                        // The peer has occasionally completed the whole
-                                        // upgrade handshake and then sent nothing at
-                                        // all. `copy_bidirectional` waits forever on
-                                        // that, so the transfer hangs at whatever
-                                        // percentage it reached with not one line in the
-                                        // log - indistinguishable from a crash. Require
-                                        // the first byte within 20s; a peer that
-                                        // switched mediums and meant it starts
-                                        // immediately.
-                                        let mut first = [0u8; 8192];
-                                        let n = match tokio::time::timeout(
-                                            std::time::Duration::from_secs(45),
-                                            sock.read(&mut first),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(0)) => {
-                                                warn!(
-                                                    "{INNER_NAME}: peer closed the upgraded socket without \
-                                                     sending anything"
-                                                );
-                                                break;
-                                            }
-                                            Ok(Ok(n)) => n,
-                                            Ok(Err(e)) => {
-                                                warn!("{INNER_NAME}: upgraded socket failed: {e}");
-                                                break;
-                                            }
-                                            Err(_) => {
-                                                warn!(
-                                                    "{INNER_NAME}: nothing on the upgraded socket within \
-                                                     45s of the prior channel draining"
-                                                );
-                                                break;
-                                            }
+                                        // There used to be a 45s limit on the phone's
+                                        // first byte here, from when it finished the
+                                        // upgrade handshake and then sent nothing. That
+                                        // was the multiplex channel close above going
+                                        // missing. A phone that gives up now closes the
+                                        // socket, which ends the copy like any other
+                                        // ending, and the byte counts below show whether
+                                        // it ever sent anything.
+                                        let copied = tokio::select! {
+                                            r = tokio::io::copy_bidirectional(&mut sock, &mut ours) => r,
+                                            _ = pump_ctk.cancelled() => break,
                                         };
-                                        if ours.write_all(&first[..n]).await.is_err() {
-                                            break;
-                                        }
-
-                                        match tokio::io::copy_bidirectional(&mut sock, &mut ours).await {
+                                        match copied {
                                             Ok((from_phone, to_phone)) => info!(
                                                 "{INNER_NAME}: upgraded socket closed ({from_phone} B in, \
                                                  {to_phone} B out)"
@@ -787,7 +780,7 @@ impl BleReceiverAdvertiser {
                                     ),
                                 }
                             }
-                            _ = down_rx.recv() => {
+                            _ = link_down.cancelled() => {
                                 warn!("{INNER_NAME}: BLE link dropped, tearing the bridge down");
                                 break;
                             }
@@ -799,7 +792,10 @@ impl BleReceiverAdvertiser {
             }
         });
 
-        let visibility = self.visibility.clone();
+        let mut visibility = self.visibility.clone();
+        let subscribers_wake = wake_tx.clone();
+        let status_wake = wake_tx.clone();
+        let completion_wake = wake_tx;
         tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -816,6 +812,17 @@ impl BleReceiverAdvertiser {
                 ));
             }
             let provider = create_result.ServiceProvider()?;
+            // The loop below reads the status itself; this only tells it when
+            // to look.
+            provider.AdvertisementStatusChanged(&TypedEventHandler::<
+                GattServiceProvider,
+                GattServiceProviderAdvertisementStatusChangedEventArgs,
+            >::new(move |_, _| {
+                if status_wake.send(()).is_err() {
+                    debug!("{INNER_NAME}: the advertiser has stopped");
+                }
+                Ok(())
+            }))?;
 
             // Serve the full advertisement from the slot-0 characteristic. The
             // phone connects after seeing our advert and reads this; with no
@@ -915,13 +922,16 @@ impl BleReceiverAdvertiser {
                         // Unblock the current session so the transfer fails
                         // visibly instead of hanging.
                         if let Ok(slot) = handler_down.lock() {
-                            if let Some(tx) = slot.as_ref() {
-                                if tx.send(()).is_err() {
-                                    debug!("{INNER_NAME}: the session had already ended");
-                                }
+                            if let Some(link_down) = slot.as_ref() {
+                                link_down.cancel();
                             }
                         }
                     }
+                }
+                // Hidden pauses the advertisement only with no phone
+                // subscribed, and a recycle waits for the phone to go.
+                if subscribers_wake.send(()).is_err() {
+                    debug!("{INNER_NAME}: the advertiser has stopped");
                 }
                 Ok(())
             }))?;
@@ -1248,7 +1258,15 @@ impl BleReceiverAdvertiser {
                     // handler thread, where waiting on the async op is illegal
                     // (0x8000000E) and can deadlock. The retry is driven entirely
                     // by the delivery-completion callback.
-                    notify_confirm(confirm_tx.clone(), confirm, 5, device.clone());
+                    if let Some(generation) = started {
+                        notify_confirm(
+                            confirm_tx.clone(),
+                            confirm,
+                            device.clone(),
+                            handler_active.clone(),
+                            generation,
+                        );
+                    }
                 }
                 handler_us.fetch_add(
                     t_enter.elapsed().as_micros() as u64,
@@ -1306,17 +1324,19 @@ impl BleReceiverAdvertiser {
             let mut tx_queue: std::collections::VecDeque<Vec<u8>> =
                 std::collections::VecDeque::new();
             // The id of the indication in flight, 0 for none. An id rather than
-            // a flag: once the bound below gives up on one, its late completion
-            // must not clear the next one's slot and let two out at once.
+            // a flag: once a switch to the upgraded socket gives up on one, its
+            // late completion must not clear the next one's slot and let two
+            // out at once.
             let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let mut next_indication: u64 = 0;
-            // When the outstanding indication went out, so the gate can stop
-            // waiting on a confirmation the phone is never going to send.
-            let mut in_flight_since: Option<std::time::Instant> = None;
 
+            let runtime = tokio::runtime::Handle::current();
+            let mut sends = crate::hdl::ble_sends();
+            // Set while a recycle waits for the lingering phone to go.
+            let mut recycling: Option<tokio::time::Instant> = None;
             let mut last_status: i32 = -1;
             let mut adv_paused = false;
-            while !ctk.is_cancelled() {
+            loop {
                 while let Ok(msg) = outbound_rx.try_recv() {
                     frame_weave(&msg, &mut tx_queue);
                 }
@@ -1337,50 +1357,57 @@ impl BleReceiverAdvertiser {
                     );
                 }
 
-                // Stop waiting on a confirmation the phone has stopped sending.
+                // Stop waiting on confirmations once the session has moved to
+                // its upgraded socket.
                 //
                 // Once the phone joins the hotspot it quits confirming our
                 // indications, so the gate would otherwise sit on the
                 // outstanding one for the full 30s ATT timeout - and the
                 // switch-critical multiplex channel-close, queued behind it,
                 // would reach the phone far too late to matter (measured: the
-                // transfer then dies at "nothing on the upgraded socket within
-                // 45s"). This is a safety bound on the wait, not a fallback:
-                // normal confirmations land in well under a second, so it only
-                // trips on a genuine stall, and it proceeds to the next packet
-                // through the same ordered, reliable, one-at-a-time path rather
-                // than firing anything out of band. The stalled indication's own
-                // 30s ATT timeout still runs, harmlessly, since BLE is being
-                // abandoned for the upgraded socket anyway.
-                let current = in_flight.load(std::sync::atomic::Ordering::Relaxed);
-                if current != 0 {
-                    if let Some(since) = in_flight_since {
-                        if since.elapsed() >= std::time::Duration::from_secs(5)
-                            && in_flight
-                                .compare_exchange(
-                                    current,
-                                    0,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                )
-                                .is_ok()
-                        {
-                            warn!(
-                                "{INNER_NAME}: indication unconfirmed after 5s; proceeding to the \
-                                 next rather than stalling the switch"
-                            );
-                            outstanding.done(1);
-                            in_flight_since = None;
-                        }
+                // transfer then died at "nothing on the upgraded socket within
+                // 45s"). This used to be a 5s limit on every indication; the
+                // switch is the event it stood in for. The rest of this
+                // session's packets go straight to the stack, in order.
+                let flush = flush_generation.load(std::sync::atomic::Ordering::Relaxed);
+                let flushing = flush != 0
+                    && outbound_active
+                        .lock()
+                        .is_ok_and(|a| a.generation() == Some(flush));
+                if flushing {
+                    let current = in_flight.load(std::sync::atomic::Ordering::Relaxed);
+                    if current != 0
+                        && in_flight
+                            .compare_exchange(
+                                current,
+                                0,
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        info!(
+                            "{INNER_NAME}: switched to the upgraded socket; no longer waiting on \
+                             the unconfirmed indication"
+                        );
+                        outstanding.done(1);
                     }
                 }
 
-                // At most one indication outstanding. The completion handler
-                // clears the slot, so the next goes out only once the phone has
-                // confirmed the previous one - or once the bound above gives up
-                // on it. Whichever of the two clears it counts the packet off.
-                if in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                    if let Some(pkt) = tx_queue.pop_front() {
+                // At most one indication outstanding, except after the switch.
+                // The completion handler clears the slot, so the next goes out
+                // only once the phone has confirmed the previous one - or once
+                // the switch gives up on it. Whichever of the two clears it
+                // counts the packet off.
+                loop {
+                    if !flushing && in_flight.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                        break;
+                    }
+                    let Some(pkt) = tx_queue.pop_front() else {
+                        break;
+                    };
+                    let gated = !flushing;
+                    {
                         let ctr = (pkt[0] >> 4) & 0x07;
                         let queued = tx_queue.len();
                         next_indication += 1;
@@ -1394,9 +1421,12 @@ impl BleReceiverAdvertiser {
                                 .and_then(|a| a.device().map(str::to_string));
                             // Taken before sending: the completion can run
                             // before the call returns.
-                            in_flight.store(id, std::sync::atomic::Ordering::Relaxed);
+                            if gated {
+                                in_flight.store(id, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let slot = in_flight.clone();
                             let confirmed = outstanding.clone();
+                            let wake = completion_wake.clone();
                             let sent_at = std::time::Instant::now();
                             let sent = notify_device(
                                 &server_tx,
@@ -1421,16 +1451,21 @@ impl BleReceiverAdvertiser {
                                     }
                                     // Only if this indication still holds the
                                     // slot; a late one leaves the next alone.
-                                    if slot
-                                        .compare_exchange(
-                                            id,
-                                            0,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        )
-                                        .is_ok()
+                                    if gated
+                                        && slot
+                                            .compare_exchange(
+                                                id,
+                                                0,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            )
+                                            .is_ok()
                                     {
                                         confirmed.done(1);
+                                    }
+                                    // The next packet can go now.
+                                    if wake.send(()).is_err() {
+                                        debug!("{INNER_NAME}: the advertiser has stopped");
                                     }
                                 },
                             );
@@ -1438,14 +1473,20 @@ impl BleReceiverAdvertiser {
                             Ok(())
                         };
                         match send() {
-                            // Record when this one went out, for the stall
-                            // bound above.
-                            Ok(()) => in_flight_since = Some(std::time::Instant::now()),
+                            // After the switch a packet is done with once the
+                            // stack has it.
+                            Ok(()) => {
+                                if !gated {
+                                    outstanding.done(1);
+                                }
+                            }
                             // It never went out, so no completion will count
                             // it off.
                             Err(e) => {
                                 warn!("{INNER_NAME}: weave send failed: {e}");
-                                in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
+                                if gated {
+                                    in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 outstanding.done(1);
                             }
                         }
@@ -1484,13 +1525,14 @@ impl BleReceiverAdvertiser {
                 // Bluetooth while mDNS has already gone quiet - but only with no
                 // phone subscribed, for the same reason: a receive in progress
                 // keeps the advertisement, and it stops once that phone leaves.
-                let hidden = *visibility.borrow() == crate::hdl::Visibility::Invisible;
+                let hidden =
+                    *visibility.borrow_and_update() == crate::hdl::Visibility::Invisible;
                 let subscribed = server_tx
                     .SubscribedClients()
                     .and_then(|c| c.Size())
                     .unwrap_or(0)
                     > 0;
-                let sending = crate::hdl::ble_send_in_progress();
+                let sending = *sends.borrow_and_update() > 0;
                 let want_paused = sending || (hidden && !subscribed);
                 if want_paused != adv_paused {
                     if want_paused {
@@ -1514,6 +1556,9 @@ impl BleReceiverAdvertiser {
                     }
                     adv_paused = want_paused;
                     last_status = -1;
+                    // A pause takes over from a recycle in progress, and the
+                    // resume restarts the advertisement.
+                    recycling = None;
                 }
 
                 // A session ended: stop and restart advertising, which drops the
@@ -1560,22 +1605,35 @@ impl BleReceiverAdvertiser {
                         if let Err(e) = provider.StopAdvertising() {
                             warn!("{INNER_NAME}: could not stop advertising to recycle: {e}");
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        // Advertise again once the phone is off the link. That
+                        // used to be a flat 500 ms sleep on this thread; the
+                        // phone leaving shows up as the subscribers changing.
+                        // The 2 s limit stands in for that event, should Windows
+                        // ever keep a client through StopAdvertising: staying
+                        // off the air would hide us from every phone.
+                        recycling =
+                            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+                    }
+                }
+                if let Some(deadline) = recycling {
+                    let subs = server_tx
+                        .SubscribedClients()
+                        .and_then(|c| c.Size())
+                        .unwrap_or(0);
+                    let stopped = provider
+                        .AdvertisementStatus()
+                        .is_ok_and(|s| s == GattServiceProviderAdvertisementStatus::Stopped);
+                    if subs == 0 || stopped || tokio::time::Instant::now() >= deadline {
+                        recycling = None;
                         match provider.StartAdvertisingWithParameters(&params) {
-                            Ok(()) => {
-                                // Did it actually drop? If subscribers is still 1
-                                // the recycle did not do what it is here to do,
-                                // and the next transfer in either direction will
-                                // fight for the link.
-                                let now = server_tx
-                                    .SubscribedClients()
-                                    .and_then(|c| c.Size())
-                                    .unwrap_or(0);
-                                info!(
-                                    "{INNER_NAME}: recycled to drop a lingering subscriber; \
-                                     subscribers now {now}"
-                                );
-                            }
+                            // Did it actually drop? If subscribers is still 1
+                            // the recycle did not do what it is here to do, and
+                            // the next transfer in either direction will fight
+                            // for the link.
+                            Ok(()) => info!(
+                                "{INNER_NAME}: recycled to drop a lingering subscriber; \
+                                 subscribers now {subs}"
+                            ),
                             Err(e) => warn!("{INNER_NAME}: could not restart advertising: {e}"),
                         }
                         last_status = -1;
@@ -1604,7 +1662,7 @@ impl BleReceiverAdvertiser {
                             info!(
                                 "{INNER_NAME}: Bluetooth turned off; advertising again once it is back on"
                             );
-                            let back = tokio::runtime::Handle::current().block_on(async {
+                            let back = runtime.block_on(async {
                                 tokio::select! {
                                     _ = crate::hdl::bluetooth_turned_on() => true,
                                     _ = ctk.cancelled() => false,
@@ -1634,10 +1692,26 @@ impl BleReceiverAdvertiser {
                         }
                     }
                 }
-                // 50ms, not 250ms: this loop now also paces outbound
-                // indications, and at 250ms the handshake burst (~8 frames)
-                // would take two seconds to get out.
-                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                // Sleep until something changes. This used to wake every 50 ms,
+                // which also capped outbound at about 20 indications a second;
+                // now the next packet goes the moment the last is confirmed.
+                let deadline = recycling.unwrap_or_else(tokio::time::Instant::now);
+                let next = runtime.block_on(async {
+                    tokio::select! {
+                        _ = ctk.cancelled() => None,
+                        Some(msg) = outbound_rx.recv() => Some(Some(msg)),
+                        Some(()) = wake_rx.recv() => Some(None),
+                        Ok(()) = sends.changed() => Some(None),
+                        Ok(()) = visibility.changed() => Some(None),
+                        _ = tokio::time::sleep_until(deadline), if recycling.is_some() => Some(None),
+                    }
+                });
+                match next {
+                    None => break,
+                    Some(Some(msg)) => frame_weave(&msg, &mut tx_queue),
+                    Some(None) => {}
+                }
             }
 
             info!("{INNER_NAME}: tracker cancelled, stopping advertiser");
@@ -1675,8 +1749,8 @@ mod tests {
             async move { receiver.run(ctk).await }
         });
 
-        // The loop under test still ticks on a timer (#60), so give it time to
-        // act on each change.
+        // The receiver acts on each change as it happens; the gaps only keep
+        // the steps apart in the log, and give Windows time to report status.
         let settle = std::time::Duration::from_secs(2);
         tokio::time::sleep(settle).await;
         if visibility.send(Visibility::Invisible).is_err() {

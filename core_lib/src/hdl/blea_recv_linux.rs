@@ -623,12 +623,15 @@ impl BleReceiverAdvertiser {
                             Some(_) = switch_rx.recv() => {
                                 match upgraded.take() {
                                     Some(mut sock) => {
-                                        // Flush remaining bytes from duplex
+                                        // Flush remaining bytes from the duplex.
+                                        // InboundRequest writes SAFE_TO_CLOSE before it
+                                        // signals the switch, so they are already there:
+                                        // stop at the first read that would wait.
                                         loop {
                                             let mut buf = [0u8; 8192];
-                                            match tokio::time::timeout(Duration::from_millis(200), ours.read(&mut buf)).await {
-                                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                                                Ok(Ok(n)) => pending.extend_from_slice(&buf[..n]),
+                                            match ours.read(&mut buf).now_or_never() {
+                                                Some(Ok(n)) if n > 0 => pending.extend_from_slice(&buf[..n]),
+                                                _ => break,
                                             }
                                         }
                                         while pending.len() >= 4 {

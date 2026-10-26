@@ -79,6 +79,12 @@ impl ActivePeer {
     pub(crate) fn device(&self) -> Option<&str> {
         self.owner.as_ref().map(|(_, d)| d.as_str())
     }
+
+    /// The current session's generation.
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.owner.as_ref().map(|(g, _)| *g)
+    }
 }
 
 /// Outbound Weave packets queued for the peer and not yet out of our hands.
@@ -449,6 +455,7 @@ mod tests {
         // ...but the owner can start over, as a phone retrying does.
         let retry = active.start("phone-a", true).expect("same device");
         assert!(retry > first);
+        assert_eq!(active.generation(), Some(retry));
 
         // The first session ending late must not free the retry's.
         assert!(!active.end(first));
