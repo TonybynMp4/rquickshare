@@ -65,16 +65,95 @@ impl ActivePeer {
     }
 
     /// End the session of this generation, unless a newer one has started.
-    pub(crate) fn end(&mut self, generation: u64) {
+    /// Returns whether it was still the current session, so a session that
+    /// was replaced doesn't tear down the link its successor is using.
+    pub(crate) fn end(&mut self, generation: u64) -> bool {
         if self.owner.as_ref().is_some_and(|(g, _)| *g == generation) {
             self.owner = None;
+            return true;
         }
+        false
     }
 
     /// The device the current session belongs to.
     pub(crate) fn device(&self) -> Option<&str> {
         self.owner.as_ref().map(|(_, d)| d.as_str())
     }
+}
+
+/// Outbound Weave packets queued for the peer and not yet out of our hands.
+///
+/// Counted where a packet is queued and where it leaves (confirmed, given up
+/// on, or dropped with its subscriber), so a waiter sees the real number at
+/// once rather than a copy refreshed on a tick. The session waits on this
+/// before it switches to the upgraded socket or lets the link go.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[derive(Clone)]
+pub(crate) struct Outstanding(std::sync::Arc<tokio::sync::watch::Sender<usize>>);
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+impl Outstanding {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::watch::channel(0).0))
+    }
+
+    pub(crate) fn add(&self, n: usize) {
+        self.0.send_modify(|count| *count += n);
+    }
+
+    pub(crate) fn done(&self, n: usize) {
+        self.0.send_modify(|count| *count = count.saturating_sub(n));
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        *self.0.borrow()
+    }
+
+    /// Resolves once nothing is outstanding.
+    pub(crate) async fn drained(&self) {
+        let mut count = self.0.subscribe();
+        // The sender lives as long as `self`, so this only ends at zero.
+        if count.wait_for(|n| *n == 0).await.is_err() {
+            debug!("BLE receiver: the outbound counter closed");
+        }
+    }
+}
+
+/// Split one outbound message into Weave data packets of at most
+/// `packet_size` bytes, header included, numbering them from `counter`.
+///
+/// `packet_size` is what the ConnectionConfirm agreed, capped by what the link
+/// carries in one notification. A packet bigger than the link's MTU fails on
+/// the phone with GATT status 133, which is why it is not a fixed 509.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub(crate) fn weave_packets(
+    bytes: &[u8],
+    packet_size: usize,
+    counter: &std::sync::atomic::AtomicU8,
+) -> Vec<Vec<u8>> {
+    // One byte of every packet is the header; never chunk by zero.
+    let payload = packet_size.saturating_sub(1).max(1);
+    let n = bytes.len().div_ceil(payload);
+    bytes
+        .chunks(payload)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let ctr = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x07;
+            let first = if i == 0 { 0x08 } else { 0 };
+            let last = if i + 1 == n { 0x04 } else { 0 };
+            let mut pkt = Vec::with_capacity(1 + chunk.len());
+            pkt.push((ctr << 4) | first | last);
+            pkt.extend_from_slice(chunk);
+            pkt
+        })
+        .collect()
+}
+
+/// The Weave packet size to send with: the size both sides agreed, and no more
+/// than one notification on this link holds (`link_max`, when known).
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub(crate) fn send_packet_size(agreed: u16, link_max: Option<u16>) -> usize {
+    usize::from(link_max.map_or(agreed, |l| agreed.min(l)))
 }
 
 fn sha256_prefix(data: &[u8], n: usize) -> Vec<u8> {
@@ -372,10 +451,55 @@ mod tests {
         assert!(retry > first);
 
         // The first session ending late must not free the retry's.
-        active.end(first);
+        assert!(!active.end(first));
         assert!(active.owns("phone-a"));
-        active.end(retry);
+        assert!(active.end(retry));
         assert_eq!(active.device(), None);
+    }
+
+    #[test]
+    fn packets_follow_the_negotiated_size() {
+        let counter = std::sync::atomic::AtomicU8::new(6);
+        let message = vec![0xab; 50];
+        let packets = weave_packets(&message, 20, &counter);
+        assert_eq!(packets.len(), 3);
+        assert!(packets.iter().all(|p| p.len() <= 20));
+        // First and last flags, and the counter wrapping mod 8.
+        assert_eq!(packets[0][0], (6 << 4) | 0x08);
+        assert_eq!(packets[1][0], 7 << 4);
+        assert_eq!(packets[2][0], 0x04);
+        let joined: Vec<u8> = packets.iter().flat_map(|p| p[1..].to_vec()).collect();
+        assert_eq!(joined, message);
+
+        // A single packet is both first and last.
+        let one = weave_packets(&[1, 2, 3], 509, &counter);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0][0] & 0x0c, 0x0c);
+    }
+
+    #[test]
+    fn the_link_caps_the_agreed_packet_size() {
+        assert_eq!(send_packet_size(509, None), 509);
+        assert_eq!(send_packet_size(509, Some(182)), 182);
+        assert_eq!(send_packet_size(100, Some(244)), 100);
+    }
+
+    #[tokio::test]
+    async fn outstanding_drains_on_the_last_completion() {
+        let outstanding = Outstanding::new();
+        outstanding.add(2);
+        let waiter = tokio::spawn({
+            let outstanding = outstanding.clone();
+            async move { outstanding.drained().await }
+        });
+        outstanding.done(1);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        outstanding.done(1);
+        waiter.await.expect("drained");
+        // More completions than packets never wraps below zero.
+        outstanding.done(1);
+        assert_eq!(outstanding.count(), 0);
     }
 
     #[test]
