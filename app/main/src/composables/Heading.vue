@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { PropType } from 'vue';
 import { TauriVM } from '../vue_lib/helper/ParamsHelper';
+import { isReleaseBuild } from '../vue_lib/version';
 
 defineProps({
 	vm: {
@@ -33,7 +34,10 @@ const emit = defineEmits(['openSettings']);
 				:class="{'btn active:scale-95': vm.new_version}"
 				@click="vm.new_version && openUrl('https://github.com/asulwer/rquickshare/releases/latest')">
 				<span v-if="vm.new_version">Update available</span>
-				<p>
+				<p v-if="vm.version && !isReleaseBuild(vm.version)" title="Built from source, not a release, so it doesn't check for updates">
+					v{{ vm.version }} dev build
+				</p>
+				<p v-else>
 					v{{ vm.version }}
 				</p>
 				<p v-if="vm.new_version" class="text-lg">
