@@ -41,10 +41,17 @@ bigger, so Google uses one of two mechanisms:
   run a GATT server whose characteristic returns the full `BleAdvertisement`.
   (`BleAdvertisementHeader` header comment: "V2 puts the data inside a GATT
   characteristic".) Big new subsystem on both platforms.
-- **Route A — extended advertising (what we're building first).** If BLE 5
+- **Route A — extended advertising.** If BLE 5
   extended advertising is available, put the header + full advertisement on-air
   directly, no GATT. WinRT supports `UseExtendedAdvertisement`. Risk: the phone
   must *scan* extended advertisements for this to be seen — unverified.
+
+**What ships: Route B**, on Windows and Linux. The 17-byte header goes in the
+0xFEF3 service data and the full advertisement is served from GATT slot 0.
+Without the header (only the bare UUID, or a fast advertisement too big for
+Windows to send), the phone almost never connects to read us. With it, a Pixel
+logs `Received advertisement header ... numSlots=1`, matches NearbySharing and
+reads us within a few seconds.
 
 ---
 
