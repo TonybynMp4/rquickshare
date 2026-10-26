@@ -780,11 +780,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         }
 
         if v1_frame.connection_response.is_none() {
-            return Err(anyhow!(format!("Unexpected None connection_response",)));
+            return Err(anyhow!("Unexpected None connection_response"));
         }
 
         if v1_frame.connection_response.as_ref().unwrap().response() != ResponseStatus::Accept {
-            return Err(anyhow!(format!("Connection rejected by third party",)));
+            return Err(anyhow!("Connection rejected by third party"));
         }
 
         let paired_encryption = sharing_nearby::Frame {
