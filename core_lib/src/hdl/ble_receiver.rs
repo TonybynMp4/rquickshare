@@ -26,6 +26,57 @@ use sha2::{Digest, Sha256};
 /// that never sets the "last" bit must not be able to grow a buffer forever.
 pub(crate) const MAX_WEAVE_MESSAGE: usize = 5 * 1024 * 1024 + 7;
 
+/// Which device the current BLE receive session belongs to.
+///
+/// The GATT server takes writes from any device in range without pairing, and
+/// its Weave reassembly state and counters are shared. Any device that wrote a
+/// ConnectionRequest used to reset them and take over, killing a transfer in
+/// progress - even a second phone only looking for Quick Share targets. So a
+/// session belongs to the device that opened it, from its ConnectionRequest
+/// until its InboundRequest ends, and writes from any other device are
+/// ignored. The one exception is an owner that is no longer subscribed: its
+/// link is gone and the session is only waiting to notice.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[derive(Default)]
+pub(crate) struct ActivePeer {
+    owner: Option<(u64, String)>,
+    next_generation: u64,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+impl ActivePeer {
+    /// Whether writes from `device` belong to the current session.
+    pub(crate) fn owns(&self, device: &str) -> bool {
+        self.owner.as_ref().is_some_and(|(_, d)| d == device)
+    }
+
+    /// Start a session for `device` if it may have one, returning the new
+    /// session's generation. `owner_subscribed` says whether the current
+    /// owner, if any, is still subscribed.
+    pub(crate) fn start(&mut self, device: &str, owner_subscribed: bool) -> Option<u64> {
+        if let Some((_, owner)) = &self.owner {
+            if owner != device && owner_subscribed {
+                return None;
+            }
+        }
+        self.next_generation += 1;
+        self.owner = Some((self.next_generation, device.to_string()));
+        Some(self.next_generation)
+    }
+
+    /// End the session of this generation, unless a newer one has started.
+    pub(crate) fn end(&mut self, generation: u64) {
+        if self.owner.as_ref().is_some_and(|(g, _)| *g == generation) {
+            self.owner = None;
+        }
+    }
+
+    /// The device the current session belongs to.
+    pub(crate) fn device(&self) -> Option<&str> {
+        self.owner.as_ref().map(|(_, d)| d.as_str())
+    }
+}
+
 fn sha256_prefix(data: &[u8], n: usize) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -304,6 +355,36 @@ mod tests {
         let adv = build_full_receiver_advertisement(&[1, 2, 3, 4], 3, &name);
         let (parsed, _) = parse_full_advertisement(&adv).expect("parses");
         assert!(name.starts_with(&parsed));
+    }
+
+    #[test]
+    fn a_session_belongs_to_the_device_that_opened_it() {
+        let mut active = ActivePeer::default();
+        let first = active.start("phone-a", false).expect("free server");
+        assert!(active.owns("phone-a"));
+        assert!(!active.owns("phone-b"));
+
+        // Another device can't take over while the owner is still there...
+        assert_eq!(active.start("phone-b", true), None);
+        assert!(active.owns("phone-a"));
+        // ...but the owner can start over, as a phone retrying does.
+        let retry = active.start("phone-a", true).expect("same device");
+        assert!(retry > first);
+
+        // The first session ending late must not free the retry's.
+        active.end(first);
+        assert!(active.owns("phone-a"));
+        active.end(retry);
+        assert_eq!(active.device(), None);
+    }
+
+    #[test]
+    fn an_owner_that_left_does_not_block_the_next_device() {
+        let mut active = ActivePeer::default();
+        active.start("phone-a", false).expect("free server");
+        // phone-a's link is gone but its session hasn't ended yet.
+        assert!(active.start("phone-b", false).is_some());
+        assert!(active.owns("phone-b"));
     }
 
     #[test]

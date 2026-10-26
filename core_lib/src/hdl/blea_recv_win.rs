@@ -68,7 +68,12 @@ const BLE_SOCKET_SERVER_TX_GUID: GUID = GUID::from_u128(0x0000_0100_0004_1000_80
 ///
 /// The same 5 bytes are re-sent, keeping the Weave counter the phone never saw.
 /// Bounded: this recovers from a transient, it does not spin.
-fn notify_confirm(confirm_tx: GattLocalCharacteristic, confirm: [u8; 5], attempts_left: u32) {
+fn notify_confirm(
+    confirm_tx: GattLocalCharacteristic,
+    confirm: [u8; 5],
+    attempts_left: u32,
+    device: String,
+) {
     let buffer = match (|| {
         let w = DataWriter::new()?;
         w.WriteBytes(&confirm)?;
@@ -81,42 +86,101 @@ fn notify_confirm(confirm_tx: GattLocalCharacteristic, confirm: [u8; 5], attempt
         }
     };
 
-    match confirm_tx.NotifyValueAsync(&buffer) {
-        Ok(op) => {
-            let op_for_cb = op.clone();
-            let tx_for_cb = confirm_tx.clone();
-            let _ = op.SetCompleted(&AsyncOperationCompletedHandler::new(move |_, _| {
-                let mut statuses = Vec::new();
-                if let Ok(results) = op_for_cb.GetResults() {
-                    for i in 0..results.Size().unwrap_or(0) {
-                        if let Ok(r) = results.GetAt(i) {
-                            statuses.push(r.Status().map(|s| s.0).unwrap_or(-1));
-                        }
+    let tx_for_cb = confirm_tx.clone();
+    let device_for_cb = device.clone();
+    let sent = notify_device(&confirm_tx, &buffer, Some(&device), move |statuses| {
+        let delivered = !statuses.is_empty() && statuses.iter().all(|s| *s == 0);
+        if delivered {
+            info!(
+                "*** {INNER_NAME}: ConnectionConfirm delivery statuses {statuses:?} \
+                 (0 = Success) ***"
+            );
+        } else if attempts_left > 0 {
+            warn!(
+                "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}); \
+                 retrying, {attempts_left} attempt(s) left ***"
+            );
+            notify_confirm(
+                tx_for_cb.clone(),
+                confirm,
+                attempts_left - 1,
+                device_for_cb.clone(),
+            );
+        } else {
+            warn!(
+                "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}) and \
+                 no retries left; the peer will drop the link ***"
+            );
+        }
+    });
+    if let Err(e) = sent {
+        warn!("{INNER_NAME}: NotifyValueAsync failed: {e}");
+    }
+}
+
+use super::ble_receiver::ActivePeer;
+
+/// The Bluetooth device id behind a GATT session, for telling peers apart.
+fn session_device(
+    session: windows::core::Result<
+        windows::Devices::Bluetooth::GenericAttributeProfile::GattSession,
+    >,
+) -> Option<String> {
+    Some(session.ok()?.DeviceId().ok()?.Id().ok()?.to_string_lossy())
+}
+
+/// Send `buffer` as an indication to `device`, and call `done` with the
+/// delivery statuses (0 = Success) once it completes.
+///
+/// Only the session's device gets it. Notifying every subscriber sent this
+/// session's Weave packets to any other device subscribed at the time, which
+/// is garbage to it. When the device can't be found among the subscribers -
+/// it has just gone - this falls back to all of them, as before.
+fn notify_device(
+    characteristic: &GattLocalCharacteristic,
+    buffer: &windows::Storage::Streams::IBuffer,
+    device: Option<&str>,
+    done: impl Fn(Vec<i32>) + Send + 'static,
+) -> windows::core::Result<()> {
+    if let Some(client) = device.and_then(|d| subscribed_client(characteristic, d)) {
+        let op = characteristic.NotifyValueForSubscribedClientAsync(buffer, &client)?;
+        let result = op.clone();
+        op.SetCompleted(&AsyncOperationCompletedHandler::new(move |_, _| {
+            let status = result
+                .GetResults()
+                .and_then(|r| r.Status())
+                .map(|s| s.0)
+                .unwrap_or(-1);
+            done(vec![status]);
+            Ok(())
+        }))
+    } else {
+        let op = characteristic.NotifyValueAsync(buffer)?;
+        let results = op.clone();
+        op.SetCompleted(&AsyncOperationCompletedHandler::new(move |_, _| {
+            let mut statuses = Vec::new();
+            if let Ok(results) = results.GetResults() {
+                for i in 0..results.Size().unwrap_or(0) {
+                    if let Ok(r) = results.GetAt(i) {
+                        statuses.push(r.Status().map(|s| s.0).unwrap_or(-1));
                     }
                 }
-                let delivered = !statuses.is_empty() && statuses.iter().all(|s| *s == 0);
-                if delivered {
-                    info!(
-                        "*** {INNER_NAME}: ConnectionConfirm delivery statuses {statuses:?} \
-                         (0 = Success) ***"
-                    );
-                } else if attempts_left > 0 {
-                    warn!(
-                        "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}); \
-                         retrying, {attempts_left} attempt(s) left ***"
-                    );
-                    notify_confirm(tx_for_cb.clone(), confirm, attempts_left - 1);
-                } else {
-                    warn!(
-                        "*** {INNER_NAME}: ConnectionConfirm not delivered ({statuses:?}) and \
-                         no retries left; the peer will drop the link ***"
-                    );
-                }
-                Ok(())
-            }));
-        }
-        Err(e) => warn!("{INNER_NAME}: NotifyValueAsync failed: {e}"),
+            }
+            done(statuses);
+            Ok(())
+        }))
     }
+}
+
+/// The subscribed client of `characteristic` that is `device`, if subscribed.
+fn subscribed_client(
+    characteristic: &GattLocalCharacteristic,
+    device: &str,
+) -> Option<windows::Devices::Bluetooth::GenericAttributeProfile::GattSubscribedClient> {
+    let clients = characteristic.SubscribedClients().ok()?;
+    (0..clients.Size().ok()?)
+        .filter_map(|i| clients.GetAt(i).ok())
+        .find(|c| session_device(c.Session()).as_deref() == Some(device))
 }
 
 fn adv_status_name(s: i32) -> &'static str {
@@ -199,8 +263,21 @@ impl BleReceiverAdvertiser {
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let handler_inbound = inbound_slot.clone();
         let handler_down = down_slot.clone();
-        // Signalled by the write handler when a Weave ConnectionRequest arrives.
-        let (new_session_tx, mut new_session_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // The device the current session belongs to, and that session's
+        // generation. The GATT server takes writes from any device in range
+        // without pairing, and the reassembly state and counters are shared, so
+        // any device that wrote a ConnectionRequest used to reset them and take
+        // over - killing a transfer in progress, even when it was only a second
+        // phone looking for Quick Share targets. Only the device that opened the
+        // session may write to it now; see `ActivePeer`.
+        let active = std::sync::Arc::new(std::sync::Mutex::new(ActivePeer::default()));
+        let session_active = active.clone();
+        let handler_active = active.clone();
+        let subscribers_active = active.clone();
+        let outbound_active = active.clone();
+        // Signalled by the write handler when a Weave ConnectionRequest arrives,
+        // with the generation of the session to start.
+        let (new_session_tx, mut new_session_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -263,8 +340,9 @@ impl BleReceiverAdvertiser {
 
         // Supervisor: build a fresh session for every Weave connection.
         tokio::spawn(async move {
-            while new_session_rx.recv().await.is_some() {
+            while let Some(generation) = new_session_rx.recv().await {
                 info!("{INNER_NAME}: new Weave connection, starting a fresh session");
+                let end_active = session_active.clone();
 
                 let (inbound_tx, mut inbound_rx) =
                     tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -368,6 +446,11 @@ impl BleReceiverAdvertiser {
                     // Drop the peer's GATT connection, so the next transfer - in either
                     // direction - starts from a clean link.
                     end_recycle.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Free the server for the next device, unless a newer
+                    // session already took it.
+                    if let Ok(mut active) = end_active.lock() {
+                        active.end(generation);
+                    }
                 });
 
                 // Pump: reassembled Weave messages in, framed replies out.
@@ -805,17 +888,25 @@ impl BleReceiverAdvertiser {
             >::new(move |sender, _| {
                 if let Some(s) = sender.as_ref() {
                     let n = s.SubscribedClients().and_then(|c| c.Size()).unwrap_or(0);
-                    if n == 0 {
-                        warn!("{INNER_NAME}: phone unsubscribed - BLE link dropped");
+                    info!("{INNER_NAME}: server-tx subscribers = {n}");
+                    // The session's own device leaving is what ends it, not the
+                    // count reaching zero: with a second device subscribed, the
+                    // count never would.
+                    let owner = subscribers_active
+                        .lock()
+                        .ok()
+                        .and_then(|a| a.device().map(str::to_string));
+                    if owner.is_some_and(|d| subscribed_client(s, &d).is_none()) {
+                        warn!("{INNER_NAME}: the session's phone unsubscribed - BLE link dropped");
                         // Unblock the current session so the transfer fails
                         // visibly instead of hanging.
                         if let Ok(slot) = handler_down.lock() {
                             if let Some(tx) = slot.as_ref() {
-                                let _ = tx.send(());
+                                if tx.send(()).is_err() {
+                                    debug!("{INNER_NAME}: the session had already ended");
+                                }
                             }
                         }
-                    } else {
-                        info!("{INNER_NAME}: server-tx subscribers = {n}");
                     }
                 }
                 Ok(())
@@ -890,6 +981,37 @@ impl BleReceiverAdvertiser {
                     request.Respond()?;
                 }
                 deferral.Complete()?;
+
+                // Whose write this is. A ConnectionRequest may start a session;
+                // anything else must come from the device whose session it is.
+                // See `ActivePeer`.
+                let device = session_device(args.Session()).unwrap_or_default();
+                let mut started: Option<u64> = None;
+                if let Some(&head) = buf.first() {
+                    let is_request = head & 0x80 != 0 && head & 0x0f == 0;
+                    let allowed = match handler_active.lock() {
+                        Ok(mut active) if is_request => {
+                            let owner_subscribed = active
+                                .device()
+                                .is_some_and(|d| subscribed_client(&confirm_tx, d).is_some());
+                            started = active.start(&device, owner_subscribed);
+                            started.is_some()
+                        }
+                        Ok(active) => active.owns(&device),
+                        Err(_) => false,
+                    };
+                    if !allowed {
+                        if is_request {
+                            info!(
+                                "{INNER_NAME}: ignoring a ConnectionRequest from {device}: another \
+                                 device's session is active"
+                            );
+                        } else {
+                            trace!("{INNER_NAME}: ignoring a write from {device}, not this session's");
+                        }
+                        return Ok(());
+                    }
+                }
 
                 // Weave framing. Header byte: bit7 = control(1)/data(0).
                 // Data packets: bits 6-4 = counter, bit3 = first fragment,
@@ -1023,8 +1145,10 @@ impl BleReceiverAdvertiser {
 
                     // Command 0 = ConnectionRequest, i.e. a new Weave
                     // connection. Build it a session of its own.
-                    if buf[0] & 0x0f == 0 {
-                        let _ = new_session_tx.send(());
+                    if let Some(generation) = started {
+                        if new_session_tx.send(generation).is_err() {
+                            warn!("{INNER_NAME}: the session supervisor is gone");
+                        }
                     }
                     info!(
                         "*** {INNER_NAME}: weave control {len} B: ctr={} cmd={} ({}) {:02x?} ***",
@@ -1106,7 +1230,7 @@ impl BleReceiverAdvertiser {
                     // handler thread, where waiting on the async op is illegal
                     // (0x8000000E) and can deadlock. The retry is driven entirely
                     // by the delivery-completion callback.
-                    notify_confirm(confirm_tx.clone(), confirm, 5);
+                    notify_confirm(confirm_tx.clone(), confirm, 5, device.clone());
                 }
                 handler_us.fetch_add(
                     t_enter.elapsed().as_micros() as u64,
@@ -1239,50 +1363,42 @@ impl BleReceiverAdvertiser {
                         let send = || -> Result<(), anyhow::Error> {
                             let w = DataWriter::new()?;
                             w.WriteBytes(&pkt)?;
-                            match server_tx.NotifyValueAsync(&w.DetachBuffer()?) {
-                                Ok(op) => {
-                                    in_flight
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    let flag = in_flight.clone();
-                                    let op_for_log = op.clone();
-                                    let sent_at = std::time::Instant::now();
-                                    let _ = op.SetCompleted(
-                                        &AsyncOperationCompletedHandler::new(move |_, _| {
-                                            let mut statuses = Vec::new();
-                                            if let Ok(results) = op_for_log.GetResults() {
-                                                for i in 0..results.Size().unwrap_or(0) {
-                                                    if let Ok(r) = results.GetAt(i) {
-                                                        statuses.push(
-                                                            r.Status().map(|s| s.0).unwrap_or(-1),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            let ms = sent_at.elapsed().as_millis();
-                                            // 30 s is the ATT timeout; anything
-                                            // approaching it means the link is
-                                            // about to be dropped under us.
-                                            if statuses.iter().any(|s| *s != 0) || ms > 10_000 {
-                                                warn!(
-                                                    "{INNER_NAME}: indication ctr={ctr} confirmed \
-                                                     after {ms} ms, statuses {statuses:?} \
-                                                     (0 = Success), {queued} still queued"
-                                                );
-                                            } else {
-                                                debug!(
-                                                    "{INNER_NAME}: indication ctr={ctr} confirmed \
-                                                     in {ms} ms ({queued} queued)"
-                                                );
-                                            }
-                                            flag.store(
-                                                false,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                            Ok(())
-                                        }),
-                                    );
-                                }
-                                Err(e) => warn!("{INNER_NAME}: NotifyValueAsync failed: {e}"),
+                            let device = outbound_active
+                                .lock()
+                                .ok()
+                                .and_then(|a| a.device().map(str::to_string));
+                            // Taken before sending: the completion can run
+                            // before the call returns.
+                            in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let flag = in_flight.clone();
+                            let sent_at = std::time::Instant::now();
+                            let sent = notify_device(
+                                &server_tx,
+                                &w.DetachBuffer()?,
+                                device.as_deref(),
+                                move |statuses| {
+                                    let ms = sent_at.elapsed().as_millis();
+                                    // 30 s is the ATT timeout; anything
+                                    // approaching it means the link is
+                                    // about to be dropped under us.
+                                    if statuses.iter().any(|s| *s != 0) || ms > 10_000 {
+                                        warn!(
+                                            "{INNER_NAME}: indication ctr={ctr} confirmed \
+                                             after {ms} ms, statuses {statuses:?} \
+                                             (0 = Success), {queued} still queued"
+                                        );
+                                    } else {
+                                        debug!(
+                                            "{INNER_NAME}: indication ctr={ctr} confirmed \
+                                             in {ms} ms ({queued} queued)"
+                                        );
+                                    }
+                                    flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                                },
+                            );
+                            if let Err(e) = sent {
+                                in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
+                                warn!("{INNER_NAME}: NotifyValueAsync failed: {e}");
                             }
                             Ok(())
                         };
