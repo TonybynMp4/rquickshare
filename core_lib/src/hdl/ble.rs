@@ -650,7 +650,7 @@ async fn bluetooth_turned_on(adapter: &Adapter) {
 /// Resolves when the Bluetooth radio turns on. Like on Linux, it being on
 /// already doesn't count.
 #[cfg(target_os = "windows")]
-async fn bluetooth_turned_on() {
+pub(crate) async fn bluetooth_turned_on() {
     use windows::core::IInspectable;
     use windows::Devices::Bluetooth::BluetoothAdapter;
     use windows::Devices::Radios::{Radio, RadioState};
