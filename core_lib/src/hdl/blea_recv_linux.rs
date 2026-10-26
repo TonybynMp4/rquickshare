@@ -5,7 +5,7 @@
 //! advertisement (with device name and endpoint ID) over characteristic slot 0.
 //! Also hosts the uWeave socket characteristics for BLE transfer and bandwidth upgrade.
 
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use bluer::{
 };
 use futures::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::{uuid, Uuid};
 
@@ -116,8 +116,15 @@ impl BleReceiverAdvertiser {
         let current_sub_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>> =
             Arc::new(Mutex::new(None));
 
-        let tx_pending = Arc::new(AtomicUsize::new(0));
-        let tx_drained = Arc::new(Notify::new());
+        // Packets queued for the phone and not yet sent, counted where they
+        // are queued and where they leave; see `Outstanding`.
+        let outstanding = ble_receiver::Outstanding::new();
+
+        // The Weave packet size the last ConnectionConfirm agreed, and the
+        // largest notification the session's link carries (ATT MTU - 3, 0 until
+        // known). Packets are cut to the smaller.
+        let agreed_size = Arc::new(AtomicU16::new(509));
+        let link_max = Arc::new(AtomicU16::new(0));
 
         // Reassembly state for multi-packet incoming Weave messages
         struct WeaveRx {
@@ -136,18 +143,18 @@ impl BleReceiverAdvertiser {
 
         let send_pkt: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
             let current_sub_tx = current_sub_tx.clone();
-            let tx_pending = tx_pending.clone();
+            let outstanding = outstanding.clone();
             Arc::new(move |pkt: Vec<u8>| {
-                tx_pending.fetch_add(1, Ordering::Relaxed);
+                outstanding.add(1);
                 if let Ok(slot) = current_sub_tx.lock() {
                     if let Some(tx) = slot.as_ref() {
                         if tx.send(pkt).is_err() {
                             warn!("{INNER_NAME}: failed to queue BLE packet; subscriber gone");
-                            tx_pending.fetch_sub(1, Ordering::Relaxed);
+                            outstanding.done(1);
                         }
                     } else {
                         warn!("{INNER_NAME}: no active subscriber to send BLE packet to");
-                        tx_pending.fetch_sub(1, Ordering::Relaxed);
+                        outstanding.done(1);
                     }
                 }
             })
@@ -196,17 +203,18 @@ impl BleReceiverAdvertiser {
                             indicate: true,
                             method: CharacteristicNotifyMethod::Fun(Box::new({
                                 let current_sub_tx = current_sub_tx.clone();
-                                let tx_pending = tx_pending.clone();
-                                let tx_drained = tx_drained.clone();
+                                let outstanding = outstanding.clone();
                                 let down_slot = down_slot.clone();
                                 move |mut notifier| {
                                     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                                    // Kept to tell, when this loop ends, whether the
+                                    // slot still holds this loop's sender.
+                                    let own_tx = sub_tx.clone();
                                     if let Ok(mut slot) = current_sub_tx.lock() {
                                         *slot = Some(sub_tx);
                                     }
                                     let current_sub_tx = current_sub_tx.clone();
-                                    let tx_pending = tx_pending.clone();
-                                    let tx_drained = tx_drained.clone();
+                                    let outstanding = outstanding.clone();
                                     let down_slot = down_slot.clone();
                                     async move {
                                         info!(
@@ -226,10 +234,7 @@ impl BleReceiverAdvertiser {
                                                 }
                                                 Some(pkt) = sub_rx.recv() => {
                                                     let res = notifier.notify(pkt).await;
-                                                    let prev = tx_pending.fetch_sub(1, Ordering::Relaxed);
-                                                    if prev <= 1 {
-                                                        tx_drained.notify_waiters();
-                                                    }
+                                                    outstanding.done(1);
                                                     if let Err(e) = res {
                                                         warn!("{INNER_NAME}: notifier.notify failed: {e}");
                                                         break;
@@ -237,9 +242,23 @@ impl BleReceiverAdvertiser {
                                                 }
                                             }
                                         }
+                                        // A newer subscriber may already have taken the
+                                        // slot; clearing it then cut that one off.
                                         if let Ok(mut slot) = current_sub_tx.lock() {
-                                            *slot = None;
+                                            if slot.as_ref().is_some_and(|tx| tx.same_channel(&own_tx)) {
+                                                *slot = None;
+                                            }
                                         }
+                                        // Packets still queued here will never go out;
+                                        // left counted, they made every later upgrade
+                                        // sit out the full drain wait.
+                                        drop(own_tx);
+                                        sub_rx.close();
+                                        let mut dropped = 0;
+                                        while sub_rx.try_recv().is_ok() {
+                                            dropped += 1;
+                                        }
+                                        outstanding.done(dropped);
                                         info!("{INNER_NAME}: server-tx notification loop ended");
                                     }
                                     .boxed()
@@ -263,6 +282,8 @@ impl BleReceiverAdvertiser {
                                 let inbound_slot = inbound_slot.clone();
                                 let active = active.clone();
                                 let adapter = adapter.clone();
+                                let agreed_size = agreed_size.clone();
+                                let link_max = link_max.clone();
                                 move |mut buf, req| {
                                     let rx_buf = rx_buf.clone();
                                     let tx_counter = tx_counter.clone();
@@ -271,6 +292,8 @@ impl BleReceiverAdvertiser {
                                     let inbound_slot = inbound_slot.clone();
                                     let active = active.clone();
                                     let adapter = adapter.clone();
+                                    let agreed_size = agreed_size.clone();
+                                    let link_max = link_max.clone();
                                     async move {
                                         if buf.is_empty() {
                                             return Ok(());
@@ -316,6 +339,12 @@ impl BleReceiverAdvertiser {
                                                 trace!("{INNER_NAME}: ignoring a write from {device}, not this session's");
                                             }
                                             return Ok(());
+                                        }
+
+                                        // The session's link MTU, as BlueZ reports it on
+                                        // each of the owner's writes; 23 is the ATT minimum.
+                                        if req.mtu >= 23 {
+                                            link_max.store(req.mtu - 3, Ordering::Relaxed);
                                         }
 
                                         // Weave framing: bit 7: 0 = data, 1 = control
@@ -386,6 +415,7 @@ impl BleReceiverAdvertiser {
                                                 };
                                                 let version = ver_max.min(1);
                                                 let packet_size = their_max.min(509);
+                                                agreed_size.store(packet_size, Ordering::Relaxed);
 
                                                 tx_counter.store(0, Ordering::Relaxed);
                                                 if let Ok(mut st) = rx_buf.lock() {
@@ -469,8 +499,9 @@ impl BleReceiverAdvertiser {
         let session_down_slot = down_slot.clone();
         let session_tx_counter = tx_counter.clone();
         let session_send_pkt = send_pkt.clone();
-        let session_tx_pending = tx_pending.clone();
-        let session_tx_drained = tx_drained.clone();
+        let session_outstanding = outstanding.clone();
+        let session_agreed_size = agreed_size.clone();
+        let session_link_max = link_max.clone();
         let session_active = active.clone();
 
         tokio::spawn(async move {
@@ -536,8 +567,17 @@ impl BleReceiverAdvertiser {
                 // 2. Spawn pump: pipes between duplex and Weave BLE framing
                 let pump_tx_counter = session_tx_counter.clone();
                 let pump_send_pkt = session_send_pkt.clone();
-                let pump_pending = session_tx_pending.clone();
-                let pump_drained = session_tx_drained.clone();
+                let pump_outstanding = session_outstanding.clone();
+                let agreed_size = session_agreed_size.clone();
+                let link_max = session_link_max.clone();
+                // Cut to the agreed size, capped by the link's notification size.
+                let packet_size = move || {
+                    let link = link_max.load(Ordering::Relaxed);
+                    ble_receiver::send_packet_size(
+                        agreed_size.load(Ordering::Relaxed),
+                        (link > 0).then_some(link),
+                    )
+                };
 
                 tokio::spawn(async move {
                     let mut pending = Vec::new();
@@ -571,7 +611,7 @@ impl BleReceiverAdvertiser {
                                             out.extend_from_slice(&pending[..4 + len]);
                                             pending.drain(..4 + len);
 
-                                            frame_weave(&out, &pump_tx_counter, &pump_send_pkt);
+                                            frame_weave(&out, packet_size(), &pump_tx_counter, &pump_send_pkt);
                                         }
                                     }
                                 }
@@ -602,21 +642,29 @@ impl BleReceiverAdvertiser {
                                             out.extend_from_slice(&[0xfc, 0x9f, 0x5e]);
                                             out.extend_from_slice(&pending[..4 + len]);
                                             pending.drain(..4 + len);
-                                            frame_weave(&out, &pump_tx_counter, &pump_send_pkt);
+                                            frame_weave(&out, packet_size(), &pump_tx_counter, &pump_send_pkt);
                                         }
 
-                                        // Close the multiplex service channel
-                                        let disconnect = vec![
+                                        // Close the multiplex service channel. It is a
+                                        // Weave message like any other, so it goes out
+                                        // framed; it used to be sent bare, its first byte
+                                        // read as a Weave header.
+                                        let disconnect = [
                                             0x00, 0x00, 0x00, 0x08, 0x02, 0x1a, 0x05, 0x0a, 0x03, 0xfc, 0x9f, 0x5e,
                                         ];
-                                        pump_send_pkt(disconnect);
+                                        frame_weave(&disconnect, packet_size(), &pump_tx_counter, &pump_send_pkt);
 
-                                        // Wait for queued packets to drain
-                                        let drained = pump_drained.notified();
-                                        tokio::pin!(drained);
-                                        drained.as_mut().enable();
-                                        if pump_pending.load(Ordering::Relaxed) > 0 {
-                                            let _ = tokio::time::timeout(Duration::from_secs(3), drained).await;
+                                        // Wait for queued packets to drain. The 3s bound
+                                        // is a safety net only; it never picks another
+                                        // course.
+                                        if tokio::time::timeout(Duration::from_secs(3), pump_outstanding.drained())
+                                            .await
+                                            .is_err()
+                                        {
+                                            debug!(
+                                                "{INNER_NAME}: {} packet(s) still queued after 3s",
+                                                pump_outstanding.count()
+                                            );
                                         }
 
                                         info!("{INNER_NAME}: prior channel released, switching to upgraded socket");
@@ -741,21 +789,15 @@ async fn advertise(
     adapter.advertise(advertisement.clone()).await
 }
 
-/// Slices `bytes` into chunks of at most 508 bytes, adds a Weave data header,
-/// and queues each chunk via `send_pkt`.
-fn frame_weave(bytes: &[u8], tx_counter: &AtomicU8, send_pkt: &Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
-    let max_payload = 508usize;
-    let chunks: Vec<&[u8]> = bytes.chunks(max_payload).collect();
-    let n = chunks.len();
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let first = i == 0;
-        let last = i + 1 == n;
-        let ctr = tx_counter.fetch_add(1, Ordering::Relaxed) & 0x07;
-        let header = (ctr << 4) | if first { 0x08 } else { 0 } | if last { 0x04 } else { 0 };
-
-        let mut pkt = Vec::with_capacity(1 + chunk.len());
-        pkt.push(header);
-        pkt.extend_from_slice(chunk);
+/// Cuts `bytes` into Weave data packets of at most `packet_size` bytes and
+/// queues each via `send_pkt`.
+fn frame_weave(
+    bytes: &[u8],
+    packet_size: usize,
+    tx_counter: &AtomicU8,
+    send_pkt: &Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+) {
+    for pkt in ble_receiver::weave_packets(bytes, packet_size, tx_counter) {
         send_pkt(pkt);
     }
 }

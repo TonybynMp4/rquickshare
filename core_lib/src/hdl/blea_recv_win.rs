@@ -313,14 +313,17 @@ impl BleReceiverAdvertiser {
         // 10-30s to confirm - so the peer sat waiting for a frame still in our
         // queue while the switch timer ran out and the transfer died with
         // "nothing on the upgraded socket within 20s".
-        let tx_pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let pump_pending = tx_pending.clone();
-        // Signalled by the sender thread the moment its queue empties, so the
-        // bridge waits on the event rather than re-reading the counter on a
-        // 50ms tick. `Notify` is Send+Sync, so the WinRT thread can fire it
-        // directly.
-        let tx_drained = std::sync::Arc::new(tokio::sync::Notify::new());
-        let pump_drained = tx_drained.clone();
+        //
+        // The pump counts a message the moment it queues it, and the sender
+        // thread swaps that for its packets and counts each one off as its
+        // indication completes. This used to be a copy the sender refreshed on
+        // its 50 ms tick, so right after the pump queued something it still
+        // read 0 and the waits below didn't wait.
+        let outstanding = ble_receiver::Outstanding::new();
+        let pump_outstanding = outstanding.clone();
+        // The Weave packet size the last ConnectionConfirm agreed.
+        let agreed_size = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(509));
+        let confirm_size = agreed_size.clone();
 
         let session_sender = self.sender.clone();
         let session_outbound_tx = outbound_tx.clone();
@@ -365,15 +368,13 @@ impl BleReceiverAdvertiser {
                 let outbound_tx = session_outbound_tx.clone();
                 let pump_us = pump_us.clone();
                 let pump_calls = pump_calls.clone();
-                let pump_pending = pump_pending.clone();
-                let pump_drained = pump_drained.clone();
+                let pump_outstanding = pump_outstanding.clone();
                 let msg_sender = session_sender.clone();
                 let ui_sender = session_sender.clone();
                 let end_recycle = session_recycle.clone();
                 // The session task waits for its own last frames to be confirmed
                 // before releasing the link - see the recycle below.
-                let end_pending = pump_pending.clone();
-                let end_drained = pump_drained.clone();
+                let end_outstanding = pump_outstanding.clone();
 
                 tokio::spawn(async move {
                     // Off the radio while we receive: a concurrent BLE scan starves the
@@ -433,23 +434,32 @@ impl BleReceiverAdvertiser {
                     // the clock - it releases the link as soon as the peer has really
                     // caught up, and waits longer than 5s if this link is slow.
                     //
-                    // Registered before reading the counter so a drain in the gap can't
-                    // be missed. The 10s bound only stops us hanging if the sender never
-                    // drains; it does not choose a different course.
-                    let drained = end_drained.notified();
-                    tokio::pin!(drained);
-                    drained.as_mut().enable();
-                    if end_pending.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                        let _ =
-                            tokio::time::timeout(std::time::Duration::from_secs(10), drained).await;
+                    // The 10s bound only stops us hanging if the sender never drains; it
+                    // does not choose a different course.
+                    if tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        end_outstanding.drained(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!(
+                            "{INNER_NAME}: {} packet(s) still unconfirmed at the end of the session",
+                            end_outstanding.count()
+                        );
                     }
-                    // Drop the peer's GATT connection, so the next transfer - in either
-                    // direction - starts from a clean link.
-                    end_recycle.store(true, std::sync::atomic::Ordering::Relaxed);
                     // Free the server for the next device, unless a newer
                     // session already took it.
-                    if let Ok(mut active) = end_active.lock() {
-                        active.end(generation);
+                    let current = end_active
+                        .lock()
+                        .map(|mut active| active.end(generation))
+                        .unwrap_or(false);
+                    // Drop the peer's GATT connection, so the next transfer - in either
+                    // direction - starts from a clean link. Not when a newer session
+                    // replaced this one, e.g. the phone retrying a flaky first connect:
+                    // recycling then dropped the retry's link.
+                    if current {
+                        end_recycle.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 });
 
@@ -466,6 +476,16 @@ impl BleReceiverAdvertiser {
                     let mut last_report = std::time::Instant::now();
                     // Held between CLIENT_INTRODUCTION_ACK and SAFE_TO_CLOSE_PRIOR_CHANNEL.
                     let mut upgraded: Option<tokio::net::TcpStream> = None;
+                    // Counted before it can reach the sender thread, so a waiter
+                    // never sees 0 while a message sits in the channel.
+                    let queue = |out: Vec<u8>| {
+                        pump_outstanding.add(1);
+                        let sent = outbound_tx.send(out).is_ok();
+                        if !sent {
+                            pump_outstanding.done(1);
+                        }
+                        sent
+                    };
                     loop {
                         tokio::select! {
                             Some(msg) = inbound_rx.recv() => {
@@ -545,7 +565,7 @@ impl BleReceiverAdvertiser {
                                             out.extend_from_slice(&[0xfc, 0x9f, 0x5e]);
                                             out.extend_from_slice(&pending[..4 + len]);
                                             pending.drain(..4 + len);
-                                            if outbound_tx.send(out).is_err() {
+                                            if !queue(out) {
                                                 return;
                                             }
                                         }
@@ -604,7 +624,7 @@ impl BleReceiverAdvertiser {
                                             out.extend_from_slice(&[0xfc, 0x9f, 0x5e]);
                                             out.extend_from_slice(&pending[..4 + len]);
                                             pending.drain(..4 + len);
-                                            if outbound_tx.send(out).is_err() {
+                                            if !queue(out) {
                                                 break;
                                             }
                                         }
@@ -638,7 +658,7 @@ impl BleReceiverAdvertiser {
                                             0x00, 0x00, 0x00, 0x08, 0x02, 0x1a, 0x05, 0x0a, 0x03, 0xfc,
                                             0x9f, 0x5e,
                                         ];
-                                        if outbound_tx.send(disconnect).is_err() {
+                                        if !queue(disconnect) {
                                             warn!(
                                                 "{INNER_NAME}: could not queue the multiplex channel close"
                                             );
@@ -668,30 +688,24 @@ impl BleReceiverAdvertiser {
                                         // are still here or not. Queueing it was the
                                         // part that was actually missing.
                                         //
-                                        // Wait on the drained signal, not a tick.
-                                        //
-                                        // The waiter is registered *before* reading the
-                                        // counter: otherwise the sender could drain in
-                                        // the gap between the check and the await, the
-                                        // wakeup would be missed, and we'd sit out the
-                                        // full timeout. The 3s bound is a safety net
-                                        // only - if the sender never drains we proceed
-                                        // anyway rather than hang, and it never selects
-                                        // a different strategy.
-                                        let drained = pump_drained.notified();
-                                        tokio::pin!(drained);
-                                        drained.as_mut().enable();
-                                        if pump_pending.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                                            let _ = tokio::time::timeout(
-                                                std::time::Duration::from_secs(3),
-                                                drained,
-                                            )
-                                            .await;
+                                        // Wait on the drained signal, not a tick. The
+                                        // 3s bound is a safety net only - if the sender
+                                        // never drains we proceed anyway rather than
+                                        // hang, and it never selects a different
+                                        // strategy.
+                                        if tokio::time::timeout(
+                                            std::time::Duration::from_secs(3),
+                                            pump_outstanding.drained(),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            debug!("{INNER_NAME}: the prior channel did not drain within 3s");
                                         }
                                         info!(
                                             "{INNER_NAME}: prior channel released ({} packet(s) still \
                                              queued, the sender thread will finish them)",
-                                            pump_pending.load(std::sync::atomic::Ordering::Relaxed)
+                                            pump_outstanding.count()
                                         );
 
                                         // Splice rather than translate: what the phone
@@ -1183,6 +1197,7 @@ impl BleReceiverAdvertiser {
                     let their_max = u16::from_be_bytes([buf[5], buf[6]]);
                     let version = ver_max.min(1);
                     let packet_size = their_max.min(509);
+                    confirm_size.store(packet_size, std::sync::atomic::Ordering::Relaxed);
 
                     // A ConnectionRequest starts a fresh Weave connection, so
                     // reset both counters here. This handler and its state live
@@ -1221,9 +1236,12 @@ impl BleReceiverAdvertiser {
                         .SubscribedClients()
                         .and_then(|c| c.Size())
                         .unwrap_or(0);
+                    let link_max = subscribed_client(&confirm_tx, &device)
+                        .and_then(|c| c.MaxNotificationSize().ok());
                     info!(
                         "*** {INNER_NAME}: sending Weave ConnectionConfirm (v{version}, \
-                         {packet_size} B, {subscribers} subscriber(s)) ***"
+                         {packet_size} B, link notifications up to {link_max:?} B, \
+                         {subscribers} subscriber(s)) ***"
                     );
                     // Retries on non-Success delivery - see notify_confirm. Do
                     // NOT block on .join() here: this runs on a WinRT write-event
@@ -1259,33 +1277,39 @@ impl BleReceiverAdvertiser {
             // immediately by the link dropping. With one in flight, the ATT
             // timer only ever sees a single confirmation latency; the rest wait
             // in our queue where no timer is running.
+            //
+            // Packets are cut to the size the ConnectionConfirm agreed, capped by
+            // the largest notification the session's phone can take on this
+            // link. Its count of outstanding packets replaces the message's.
             let frame_weave = |bytes: &[u8], out: &mut std::collections::VecDeque<Vec<u8>>| {
-                let max_payload = 508usize; // negotiated 509 minus the header byte
-                let chunks: Vec<&[u8]> = bytes.chunks(max_payload).collect();
-                let n = chunks.len();
-                for (i, chunk) in chunks.into_iter().enumerate() {
-                    let first = i == 0;
-                    let last = i + 1 == n;
-                    let ctr = tx_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) & 0x07;
-                    let header = (ctr << 4)
-                        | if first { 0x08 } else { 0 }
-                        | if last { 0x04 } else { 0 };
-
-                    let mut pkt = Vec::with_capacity(1 + chunk.len());
-                    pkt.push(header);
-                    pkt.extend_from_slice(chunk);
-                    out.push_back(pkt);
-                }
+                let link_max = outbound_active
+                    .lock()
+                    .ok()
+                    .and_then(|a| a.device().and_then(|d| subscribed_client(&server_tx, d)))
+                    .and_then(|c| c.MaxNotificationSize().ok());
+                let size = ble_receiver::send_packet_size(
+                    agreed_size.load(std::sync::atomic::Ordering::Relaxed),
+                    link_max,
+                );
+                let packets = ble_receiver::weave_packets(bytes, size, &tx_counter);
+                outstanding.add(packets.len());
+                outstanding.done(1);
                 debug!(
-                    "{INNER_NAME}: weave queued {} B as {n} packet(s), next ctr={}",
+                    "{INNER_NAME}: weave queued {} B as {} packet(s) of up to {size} B, next ctr={}",
                     bytes.len(),
+                    packets.len(),
                     tx_counter.load(std::sync::atomic::Ordering::Relaxed) & 0x07
                 );
+                out.extend(packets);
             };
 
             let mut tx_queue: std::collections::VecDeque<Vec<u8>> =
                 std::collections::VecDeque::new();
-            let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The id of the indication in flight, 0 for none. An id rather than
+            // a flag: once the bound below gives up on one, its late completion
+            // must not clear the next one's slot and let two out at once.
+            let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let mut next_indication: u64 = 0;
             // When the outstanding indication went out, so the gate can stop
             // waiting on a confirmation the phone is never going to send.
             let mut in_flight_since: Option<std::time::Instant> = None;
@@ -1313,17 +1337,6 @@ impl BleReceiverAdvertiser {
                     );
                 }
 
-                // Publish what is still owed to the peer, so the bridge can wait
-                // for SAFE_TO_CLOSE to actually land before switching mediums.
-                let owed = tx_queue.len()
-                    + usize::from(in_flight.load(std::sync::atomic::Ordering::Relaxed));
-                tx_pending.store(owed, std::sync::atomic::Ordering::Relaxed);
-                if owed == 0 {
-                    // Everything queued has been acknowledged; wake anyone
-                    // waiting to switch mediums.
-                    tx_drained.notify_waiters();
-                }
-
                 // Stop waiting on a confirmation the phone has stopped sending.
                 //
                 // Once the phone joins the hotspot it quits confirming our
@@ -1339,27 +1352,39 @@ impl BleReceiverAdvertiser {
                 // than firing anything out of band. The stalled indication's own
                 // 30s ATT timeout still runs, harmlessly, since BLE is being
                 // abandoned for the upgraded socket anyway.
-                if in_flight.load(std::sync::atomic::Ordering::Relaxed) {
+                let current = in_flight.load(std::sync::atomic::Ordering::Relaxed);
+                if current != 0 {
                     if let Some(since) = in_flight_since {
-                        if since.elapsed() >= std::time::Duration::from_secs(5) {
+                        if since.elapsed() >= std::time::Duration::from_secs(5)
+                            && in_flight
+                                .compare_exchange(
+                                    current,
+                                    0,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                )
+                                .is_ok()
+                        {
                             warn!(
                                 "{INNER_NAME}: indication unconfirmed after 5s; proceeding to the \
                                  next rather than stalling the switch"
                             );
-                            in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
+                            outstanding.done(1);
                             in_flight_since = None;
                         }
                     }
                 }
 
                 // At most one indication outstanding. The completion handler
-                // clears the flag, so the next goes out only once the phone has
+                // clears the slot, so the next goes out only once the phone has
                 // confirmed the previous one - or once the bound above gives up
-                // on it.
-                if !in_flight.load(std::sync::atomic::Ordering::Relaxed) {
+                // on it. Whichever of the two clears it counts the packet off.
+                if in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                     if let Some(pkt) = tx_queue.pop_front() {
                         let ctr = (pkt[0] >> 4) & 0x07;
                         let queued = tx_queue.len();
+                        next_indication += 1;
+                        let id = next_indication;
                         let send = || -> Result<(), anyhow::Error> {
                             let w = DataWriter::new()?;
                             w.WriteBytes(&pkt)?;
@@ -1369,8 +1394,9 @@ impl BleReceiverAdvertiser {
                                 .and_then(|a| a.device().map(str::to_string));
                             // Taken before sending: the completion can run
                             // before the call returns.
-                            in_flight.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let flag = in_flight.clone();
+                            in_flight.store(id, std::sync::atomic::Ordering::Relaxed);
+                            let slot = in_flight.clone();
+                            let confirmed = outstanding.clone();
                             let sent_at = std::time::Instant::now();
                             let sent = notify_device(
                                 &server_tx,
@@ -1393,22 +1419,35 @@ impl BleReceiverAdvertiser {
                                              in {ms} ms ({queued} queued)"
                                         );
                                     }
-                                    flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    // Only if this indication still holds the
+                                    // slot; a late one leaves the next alone.
+                                    if slot
+                                        .compare_exchange(
+                                            id,
+                                            0,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        confirmed.done(1);
+                                    }
                                 },
                             );
-                            if let Err(e) = sent {
-                                in_flight.store(false, std::sync::atomic::Ordering::Relaxed);
-                                warn!("{INNER_NAME}: NotifyValueAsync failed: {e}");
-                            }
+                            sent?;
                             Ok(())
                         };
-                        if let Err(e) = send() {
-                            warn!("{INNER_NAME}: weave send failed: {e}");
-                        }
-                        // Record when this one went out, for the stall bound
-                        // above. Only if the send actually took the slot.
-                        if in_flight.load(std::sync::atomic::Ordering::Relaxed) {
-                            in_flight_since = Some(std::time::Instant::now());
+                        match send() {
+                            // Record when this one went out, for the stall
+                            // bound above.
+                            Ok(()) => in_flight_since = Some(std::time::Instant::now()),
+                            // It never went out, so no completion will count
+                            // it off.
+                            Err(e) => {
+                                warn!("{INNER_NAME}: weave send failed: {e}");
+                                in_flight.store(0, std::sync::atomic::Ordering::Relaxed);
+                                outstanding.done(1);
+                            }
                         }
                     }
                 }
@@ -1483,7 +1522,16 @@ impl BleReceiverAdvertiser {
                 //
                 // Skipped while paused - there is nothing to recycle, and
                 // restarting here would undo the pause above.
-                if recycle_adv.swap(false, std::sync::atomic::Ordering::Relaxed) && !adv_paused {
+                // Also skipped once a new session has started: the phone that
+                // owns it is on this link, and recycling would drop it.
+                let session_open = outbound_active
+                    .lock()
+                    .map(|a| a.device().is_some())
+                    .unwrap_or(false);
+                if recycle_adv.swap(false, std::sync::atomic::Ordering::Relaxed)
+                    && !adv_paused
+                    && !session_open
+                {
                     // Recycle only if the phone is *still* on the GATT link.
                     //
                     // The recycle exists for one job: drop a phone that stayed
