@@ -1449,8 +1449,21 @@ impl BleReceiverAdvertiser {
                             if !back {
                                 break;
                             }
+                            // Windows usually resumes a GATT service's advertisement
+                            // by itself once the radio is back - measured: status 4
+                            // a second after Bluetooth came on - and then refuses a
+                            // second start with E_ILLEGAL_METHOD_CALL. Starting it
+                            // here covers the times it does not.
                             match provider.StartAdvertisingWithParameters(&params) {
                                 Ok(()) => info!("{INNER_NAME}: Bluetooth back on, advertising again"),
+                                Err(e)
+                                    if e.code()
+                                        == windows::Win32::Foundation::E_ILLEGAL_METHOD_CALL =>
+                                {
+                                    info!(
+                                        "{INNER_NAME}: Bluetooth back on; Windows resumed the advertisement"
+                                    )
+                                }
                                 Err(e) => warn!("{INNER_NAME}: could not advertise again: {e}"),
                             }
                             last_status = -1;
